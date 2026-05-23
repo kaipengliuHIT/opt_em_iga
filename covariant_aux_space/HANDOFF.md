@@ -190,6 +190,49 @@ Runtime may need:
 If the binary fails with `libcusparse.so.12` or related errors, fix the runtime
 library visibility first.
 
+## Repository Locations
+
+Primary research repository:
+
+- `git@github.com:kaipengliuHIT/opt_em_iga.git`
+
+Related MFEM repository with multi-patch `H(curl)` work:
+
+- `git@github.com:kaipengliuHIT/mfem_for_IGA_EMopt.git`
+
+Recommended MFEM branch to preserve current local backup work:
+
+- `multipatch_hcurl_fix_backup_20260523`
+
+Recommended clone sequence on a new machine:
+
+```bash
+git clone git@github.com:kaipengliuHIT/opt_em_iga.git
+git clone git@github.com:kaipengliuHIT/mfem_for_IGA_EMopt.git
+cd mfem_for_IGA_EMopt
+git checkout multipatch_hcurl_fix_backup_20260523
+```
+
+## Recommended New-Codex Prompt
+
+On a new machine or in a fresh Codex session, start with something close to:
+
+```text
+Please work in /path/to/opt_em_iga.
+
+Read these files first:
+1. covariant_aux_space/HANDOFF.md
+2. covariant_aux_space/PROTO_MODES_NOTE.md
+3. covariant_aux_space/EDGE_YEE_STAGE_SUMMARY.md
+4. covariant_aux_space/CORE_BENCHMARK_RESULTS.md
+
+Current goal:
+- continue the auxiliary-space preconditioner study for spline H(curl) Maxwell IGA
+- treat edge_galerkin_proto as the transfer upper bound
+- treat edge_yee_proto as the real research target
+- continue with controlled h/p validation unless the code state suggests a better immediate next step
+```
+
 ## Recommended Next Step
 
 The next phase should be a controlled `h/p` study focusing on:
