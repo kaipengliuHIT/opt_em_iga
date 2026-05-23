@@ -1,0 +1,42 @@
+# Build artifacts
+*.o
+*.a
+*.so
+*.out
+*.log
+*.tmp
+*.swp
+*.swo
+
+# Executables
+adjoint_gradient_example
+adjoint_gradient_test
+adjoint_opt_loop
+adjoint_test_helmholtz
+adjoint_test_poisson
+focusing_2d
+fdfd_iga_init_demo
+fdfd_iga_init_demo_debug
+
+# Generated visualization/data
+ParaView/
+fdfd_iga_init_zero/
+fdfd_iga_init_fdfd/
+*.gf
+*.vtk
+*.png
+*.pdf
+*.csv
+
+# Python caches
+__pycache__/
+*.pyc
+
+# IDE/editor
+.vscode/
+.qoder/
+.windsurf/
+
+# OS/filesystem noise
+.DS_Store
+Thumbs.db
