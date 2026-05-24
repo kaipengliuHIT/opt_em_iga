@@ -27,6 +27,7 @@ public:
    const fdfd_iga_init::ReferenceGrid &Grid() const { return grid_; }
    const std::vector<YeeEdgeDof> &GetEdgeDofs() const;
    void BuildProlongation(mfem::DenseMatrix &P) const;
+   void BuildProlongationFast(mfem::DenseMatrix &P) const;
    void AssembleYeeCoarseOperator(
       const std::function<double(const mfem::Vector &)> &eps_fn,
       double k0,

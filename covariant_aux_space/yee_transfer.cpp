@@ -1,4 +1,7 @@
 #include "yee_transfer.hpp"
+#include <algorithm>
+#include <chrono>
+#include <iostream>
 
 namespace covariant_aux_space
 {
@@ -335,62 +338,199 @@ void YeeTransferBuilder::EvaluateReferenceCurl(
 
 void YeeTransferBuilder::BuildProlongation(mfem::DenseMatrix &P) const
 {
+   BuildProlongationFast(P);
+}
+
+void YeeTransferBuilder::BuildProlongationFast(mfem::DenseMatrix &P) const
+{
    BuildEdgeDofs();
    const int tvsize = fespace_.GetTrueVSize();
+   const int ndofs = fespace_.GetNDofs();
    const int na = static_cast<int>(edge_dofs_.size());
    P.SetSize(tvsize, na);
    P = 0.0;
 
+   if (mfem::Mpi::WorldRank() == 0)
+   {
+      std::cout << "[yee_transfer] BuildProlongationFast start: true_vsize="
+                << tvsize << ", edge_dofs=" << na << std::endl;
+   }
+   const auto t0 = std::chrono::steady_clock::now();
+
    mfem::ParFiniteElementSpace *pfes =
       const_cast<mfem::ParFiniteElementSpace *>(&fespace_);
+
    mfem::ConstantCoefficient one(1.0);
    mfem::ParBilinearForm mass(pfes);
    mass.AddDomainIntegrator(new mfem::VectorFEMassIntegrator(one));
    mass.Assemble();
+   mass.Finalize();
+   mfem::SparseMatrix &Ms = mass.SpMat();
 
+   mfem::DenseMatrix Mdense(ndofs);
+   Mdense = 0.0;
+   const int *I = Ms.GetI();
+   const int *J = Ms.GetJ();
+   const double *Data = Ms.GetData();
+   for (int r = 0; r < Ms.Height(); r++)
+   {
+      for (int p = I[r]; p < I[r + 1]; p++)
+      {
+         Mdense(r, J[p]) += Data[p];
+      }
+   }
+   mfem::DenseMatrixInverse mass_inv(Mdense);
+
+   mfem::DenseMatrix B(ndofs, na);
+   B = 0.0;
+
+   const double hx = 1.0 / double(grid_.nx - 1);
+   const double hy = 1.0 / double(grid_.ny - 1);
+   const double hz = 1.0 / double(grid_.nz - 1);
+   const int nx = grid_.nx;
+   const int ny = grid_.ny;
+   const int nz = grid_.nz;
+
+   std::vector<int> x_edge_map((nx - 1) * ny * nz, -1);
+   std::vector<int> y_edge_map(nx * (ny - 1) * nz, -1);
+   std::vector<int> z_edge_map(nx * ny * (nz - 1), -1);
+
+   auto x_id = [&](int i, int j, int k)
+   {
+      return (k * ny + j) * (nx - 1) + i;
+   };
+   auto y_id = [&](int i, int j, int k)
+   {
+      return (k * (ny - 1) + j) * nx + i;
+   };
+   auto z_id = [&](int i, int j, int k)
+   {
+      return (k * ny + j) * nx + i;
+   };
+
+   for (int idx = 0; idx < na; idx++)
+   {
+      const auto &e = edge_dofs_[idx];
+      if (e.axis == 0) { x_edge_map[x_id(e.i, e.j, e.k)] = idx; }
+      else if (e.axis == 1) { y_edge_map[y_id(e.i, e.j, e.k)] = idx; }
+      else { z_edge_map[z_id(e.i, e.j, e.k)] = idx; }
+   }
+
+   mfem::Array<int> vdofs;
+   mfem::DenseMatrix vshape;
+   mfem::Vector xi, Ehat, Ephys;
+   mfem::DenseMatrix invJ;
+   mfem::Vector curl_dummy;
+   int local_to_global[12];
+
+   for (int e = 0; e < fespace_.GetNE(); e++)
+   {
+      mfem::ElementTransformation *T = pfes->GetElementTransformation(e);
+      const mfem::FiniteElement *fe = pfes->GetFE(e);
+      pfes->GetElementVDofs(e, vdofs);
+      const int dof = fe->GetDof();
+      const int dim = T->GetSpaceDim();
+      const mfem::IntegrationRule *ir =
+         &mfem::IntRules.Get(fe->GetGeomType(), 2 * fe->GetOrder());
+      vshape.SetSize(dof, dim);
+
+      for (int q = 0; q < ir->GetNPoints(); q++)
+      {
+         const mfem::IntegrationPoint &ip = ir->IntPoint(q);
+         T->SetIntPoint(&ip);
+         fe->CalcVShape(*T, vshape);
+         GetGlobalPatchXi(e, ip, xi);
+
+         int ci = std::min(std::max(int(std::floor(xi[0] / hx)), 0), nx - 2);
+         int cj = std::min(std::max(int(std::floor(xi[1] / hy)), 0), ny - 2);
+         int ck = std::min(std::max(int(std::floor(xi[2] / hz)), 0), nz - 2);
+         const double u = (xi[0] - ci * hx) / hx;
+         const double v = (xi[1] - cj * hy) / hy;
+         const double w = (xi[2] - ck * hz) / hz;
+
+         local_to_global[0]  = x_edge_map[x_id(ci,     cj,     ck    )];
+         local_to_global[1]  = x_edge_map[x_id(ci,     cj + 1, ck    )];
+         local_to_global[2]  = x_edge_map[x_id(ci,     cj,     ck + 1)];
+         local_to_global[3]  = x_edge_map[x_id(ci,     cj + 1, ck + 1)];
+         local_to_global[4]  = y_edge_map[y_id(ci,     cj,     ck    )];
+         local_to_global[5]  = y_edge_map[y_id(ci + 1, cj,     ck    )];
+         local_to_global[6]  = y_edge_map[y_id(ci,     cj,     ck + 1)];
+         local_to_global[7]  = y_edge_map[y_id(ci + 1, cj,     ck + 1)];
+         local_to_global[8]  = z_edge_map[z_id(ci,     cj,     ck    )];
+         local_to_global[9]  = z_edge_map[z_id(ci + 1, cj,     ck    )];
+         local_to_global[10] = z_edge_map[z_id(ci,     cj + 1, ck    )];
+         local_to_global[11] = z_edge_map[z_id(ci + 1, cj + 1, ck    )];
+
+         const double weight = ip.weight * T->Weight();
+         invJ = T->Jacobian();
+         invJ.Invert();
+
+         for (int a = 0; a < 12; a++)
+         {
+            const int col = local_to_global[a];
+            if (col < 0) { continue; }
+            EvalCellEdgeBasis(a, u, v, w, hx, hy, hz, Ehat, curl_dummy);
+            Ephys.SetSize(dim);
+            Ephys = 0.0;
+            for (int c = 0; c < dim; c++)
+            {
+               for (int r = 0; r < dim; r++)
+               {
+                  Ephys[c] += invJ(r, c) * Ehat[r];
+               }
+            }
+
+            for (int i = 0; i < dof; i++)
+            {
+               int row = vdofs[i];
+               double sgn = 1.0;
+               if (row < 0)
+               {
+                  row = -row - 1;
+                  sgn = -1.0;
+               }
+               double dot = 0.0;
+               for (int d = 0; d < dim; d++)
+               {
+                  dot += vshape(i, d) * Ephys[d];
+               }
+               if (row >= 0 && row < ndofs)
+               {
+                  B(row, col) += sgn * weight * dot;
+               }
+            }
+         }
+      }
+   }
+
+   mfem::Vector rhs(ndofs), sol(ndofs), col_true(tvsize);
    mfem::ParGridFunction gf(pfes);
-   mfem::Array<int> empty_tdofs;
-   mfem::OperatorPtr A;
-   mfem::Vector X, B;
-   gf = 0.0;
-   mfem::ParLinearForm rhs(pfes);
-   {
-      EdgeBasisCoefficient first_coeff(*this, edge_dofs_[0]);
-      rhs.AddDomainIntegrator(new mfem::VectorFEDomainLFIntegrator(first_coeff));
-      rhs.Assemble();
-      mass.FormLinearSystem(empty_tdofs, gf, rhs, A, X, B);
-   }
-
-   mfem::CGSolver cg(pfes->GetComm());
-   cg.SetOperator(*A);
-   std::unique_ptr<mfem::HypreSmoother> prec;
-   if (auto *Ah = dynamic_cast<mfem::HypreParMatrix *>(A.Ptr()))
-   {
-      prec = std::make_unique<mfem::HypreSmoother>(*Ah, mfem::HypreSmoother::Jacobi);
-      cg.SetPreconditioner(*prec);
-   }
-   cg.SetRelTol(1e-10);
-   cg.SetAbsTol(0.0);
-   cg.SetMaxIter(1000);
-   cg.SetPrintLevel(0);
-
-   mfem::Vector col(tvsize);
    for (int j = 0; j < na; j++)
    {
-      gf = 0.0;
-      mfem::ParLinearForm rhs_j(pfes);
-      EdgeBasisCoefficient coeff(*this, edge_dofs_[j]);
-      rhs_j.AddDomainIntegrator(new mfem::VectorFEDomainLFIntegrator(coeff));
-      rhs_j.Assemble();
-      mass.FormLinearSystem(empty_tdofs, gf, rhs_j, A, X, B);
-      cg.SetOperator(*A);
-      cg.Mult(B, X);
-      mass.RecoverFEMSolution(X, rhs_j, gf);
-      gf.GetTrueDofs(col);
-      for (int i = 0; i < tvsize; i++)
+      for (int i = 0; i < ndofs; i++) { rhs[i] = B(i, j); }
+      mass_inv.Mult(rhs, sol);
+      for (int i = 0; i < ndofs; i++) { gf[i] = sol[i]; }
+      gf.GetTrueDofs(col_true);
+      for (int i = 0; i < tvsize; i++) { P(i, j) = col_true[i]; }
+   }
+
+   if (mfem::Mpi::WorldRank() == 0)
+   {
+      const auto t1 = std::chrono::steady_clock::now();
+      double p0norm = 0.0, p1norm = 0.0;
+      if (na > 0)
       {
-         P(i, j) = col[i];
+         for (int i = 0; i < tvsize; i++) { p0norm += P(i,0) * P(i,0); }
       }
+      if (na > 1)
+      {
+         for (int i = 0; i < tvsize; i++) { p1norm += P(i,1) * P(i,1); }
+      }
+      std::cout << "[yee_transfer] P col0 norm=" << std::sqrt(p0norm)
+                << " P col1 norm=" << std::sqrt(p1norm) << std::endl;
+      std::cout << "[yee_transfer] BuildProlongationFast done seconds="
+                << std::chrono::duration<double>(t1 - t0).count()
+                << std::endl;
    }
 }
 
