@@ -230,6 +230,8 @@ int main(int argc, char *argv[])
    real_t identity_smoother_weight = 0.0;
    real_t jacobi_smoother_weight = 0.0;
    int jacobi_smoother_iterations = 1;
+   real_t block_jacobi_smoother_weight = 0.0;
+   int block_jacobi_smoother_iterations = 1;
    bool true_residual_control = false;
    int true_residual_print_every = 0;
 
@@ -281,6 +283,13 @@ int main(int argc, char *argv[])
                   "Add omega*diag(A)^{-1}r to the auxiliary preconditioner output.");
    args.AddOption(&jacobi_smoother_iterations, "-sjit", "--jacobi-smoother-iters",
                   "Number of weighted Jacobi smoothing iterations.");
+   args.AddOption(&block_jacobi_smoother_weight, "-sbjac",
+                  "--block-jacobi-smoother",
+                  "Add omega times the inverse 2x2 real/imag diagonal block "
+                  "of A to the auxiliary preconditioner output.");
+   args.AddOption(&block_jacobi_smoother_iterations, "-sbjit",
+                  "--block-jacobi-smoother-iters",
+                  "Number of weighted 2x2 block-Jacobi smoothing iterations.");
    args.AddOption(&true_residual_control, "-trc", "--true-residual-control",
                   "-no-trc", "--no-true-residual-control",
                   "Stop GMRES using the unpreconditioned true residual norm.");
@@ -571,6 +580,8 @@ int main(int argc, char *argv[])
       edge_prec->SetIdentitySmootherWeight(identity_smoother_weight);
       edge_prec->SetOperatorJacobiSmootherWeight(jacobi_smoother_weight);
       edge_prec->SetOperatorJacobiSmootherIterations(jacobi_smoother_iterations);
+      edge_prec->SetOperatorBlockJacobiSmootherWeight(block_jacobi_smoother_weight);
+      edge_prec->SetOperatorBlockJacobiSmootherIterations(block_jacobi_smoother_iterations);
       if (prec_mode == "edge_yee" && yee_calib)
       {
          edge_prec->SetYeeDiagonalCalibration(true);

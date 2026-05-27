@@ -49,6 +49,10 @@ public:
    { operator_jacobi_smoother_weight_ = weight; }
    void SetOperatorJacobiSmootherIterations(int iterations)
    { operator_jacobi_smoother_iterations_ = std::max(1, iterations); }
+   void SetOperatorBlockJacobiSmootherWeight(double weight)
+   { operator_block_jacobi_smoother_weight_ = weight; }
+   void SetOperatorBlockJacobiSmootherIterations(int iterations)
+   { operator_block_jacobi_smoother_iterations_ = std::max(1, iterations); }
    const fdfd_iga_init::ReferenceGrid &GetYeeGrid() const
    { return yee_operator_->Grid(); }
    void SetKnotAlignGrid(bool enable, int cells_per_span = 1);
@@ -99,17 +103,29 @@ private:
    mutable mfem::Vector op_jacobi_work_;
    mutable mfem::Vector op_jacobi_res_;
    mutable mfem::Vector op_jacobi_Awork_;
+   mutable mfem::Vector op_block_jacobi_inv00_;
+   mutable mfem::Vector op_block_jacobi_inv01_;
+   mutable mfem::Vector op_block_jacobi_inv10_;
+   mutable mfem::Vector op_block_jacobi_inv11_;
+   mutable mfem::Vector op_block_jacobi_work_;
+   mutable mfem::Vector op_block_jacobi_res_;
+   mutable mfem::Vector op_block_jacobi_Awork_;
    bool yee_complex_auxiliary_ = false;
    bool yee_pml_galerkin_fallback_ = true;
    double identity_smoother_weight_ = 0.0;
    double operator_jacobi_smoother_weight_ = 0.0;
    int operator_jacobi_smoother_iterations_ = 1;
+   double operator_block_jacobi_smoother_weight_ = 0.0;
+   int operator_block_jacobi_smoother_iterations_ = 1;
 
    void MarkDirty();
    void BuildAuxiliaryOperators() const;
    void BuildOperatorJacobiSmoother() const;
    void AddOperatorJacobiSmoother(const mfem::Vector &r,
                                   mfem::Vector &z) const;
+   void BuildOperatorBlockJacobiSmoother() const;
+   void AddOperatorBlockJacobiSmoother(const mfem::Vector &r,
+                                       mfem::Vector &z) const;
    void BuildAuxDofs() const;
    void BuildTransferMatrix() const;
    void BuildAuxiliaryMatrix() const;

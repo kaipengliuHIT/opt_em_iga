@@ -62,6 +62,13 @@ void CovariantReferencePreconditioner::MarkDirty()
    op_jacobi_work_.SetSize(0);
    op_jacobi_res_.SetSize(0);
    op_jacobi_Awork_.SetSize(0);
+   op_block_jacobi_inv00_.SetSize(0);
+   op_block_jacobi_inv01_.SetSize(0);
+   op_block_jacobi_inv10_.SetSize(0);
+   op_block_jacobi_inv11_.SetSize(0);
+   op_block_jacobi_work_.SetSize(0);
+   op_block_jacobi_res_.SetSize(0);
+   op_block_jacobi_Awork_.SetSize(0);
 }
 
 void CovariantReferencePreconditioner::SetOperator(const mfem::Operator &op)
@@ -583,6 +590,7 @@ void CovariantReferencePreconditioner::BuildAuxiliaryOperators() const
    aux_rhs_block_.SetSize(2 * na);
    aux_sol_block_.SetSize(2 * na);
    BuildOperatorJacobiSmoother();
+   BuildOperatorBlockJacobiSmoother();
    built_ = true;
 }
 
@@ -659,6 +667,108 @@ void CovariantReferencePreconditioner::AddOperatorJacobiSmoother(
    z += op_jacobi_work_;
 }
 
+void CovariantReferencePreconditioner::BuildOperatorBlockJacobiSmoother() const
+{
+   if (operator_block_jacobi_smoother_weight_ == 0.0) { return; }
+   MFEM_VERIFY(op_ != nullptr,
+               "Operator must be set before building block Jacobi smoother.");
+
+   const int n2 = op_->Height();
+   MFEM_VERIFY(op_->Width() == n2, "Block Jacobi smoother requires a square operator.");
+   MFEM_VERIFY(n2 % 2 == 0, "Block Jacobi smoother requires a 2x2 real block system.");
+   const int n = n2 / 2;
+   if (op_block_jacobi_inv00_.Size() == n) { return; }
+
+   op_block_jacobi_inv00_.SetSize(n);
+   op_block_jacobi_inv01_.SetSize(n);
+   op_block_jacobi_inv10_.SetSize(n);
+   op_block_jacobi_inv11_.SetSize(n);
+
+   mfem::Vector e(n2), Ae0(n2), Ae1(n2);
+   int singular_blocks = 0;
+   double min_det_abs = std::numeric_limits<double>::infinity();
+   double max_det_abs = 0.0;
+   for (int j = 0; j < n; j++)
+   {
+      e = 0.0;
+      e[j] = 1.0;
+      op_->Mult(e, Ae0);
+
+      e = 0.0;
+      e[j + n] = 1.0;
+      op_->Mult(e, Ae1);
+
+      const double a00 = Ae0[j];
+      const double a10 = Ae0[j + n];
+      const double a01 = Ae1[j];
+      const double a11 = Ae1[j + n];
+      const double det = a00 * a11 - a01 * a10;
+      const double adet = std::abs(det);
+      if (adet > 1e-30)
+      {
+         op_block_jacobi_inv00_[j] =  a11 / det;
+         op_block_jacobi_inv01_[j] = -a01 / det;
+         op_block_jacobi_inv10_[j] = -a10 / det;
+         op_block_jacobi_inv11_[j] =  a00 / det;
+         min_det_abs = std::min(min_det_abs, adet);
+         max_det_abs = std::max(max_det_abs, adet);
+      }
+      else
+      {
+         op_block_jacobi_inv00_[j] = 0.0;
+         op_block_jacobi_inv01_[j] = 0.0;
+         op_block_jacobi_inv10_[j] = 0.0;
+         op_block_jacobi_inv11_[j] = 0.0;
+         singular_blocks++;
+      }
+   }
+
+   if (mfem::Mpi::WorldRank() == 0)
+   {
+      std::cout << "[covariant_aux_space] operator 2x2 block Jacobi smoother built: "
+                << "weight=" << operator_block_jacobi_smoother_weight_
+                << ", iterations=" << operator_block_jacobi_smoother_iterations_
+                << ", singular_blocks=" << singular_blocks
+                << ", det_abs_range=[" << min_det_abs << ", " << max_det_abs << "]"
+                << std::endl;
+   }
+}
+
+void CovariantReferencePreconditioner::AddOperatorBlockJacobiSmoother(
+   const mfem::Vector &r,
+   mfem::Vector &z) const
+{
+   if (operator_block_jacobi_smoother_weight_ == 0.0) { return; }
+
+   const int n2 = r.Size();
+   MFEM_VERIFY(n2 % 2 == 0, "Block Jacobi smoother requires a 2x2 real block residual.");
+   const int n = n2 / 2;
+   op_block_jacobi_work_.SetSize(n2);
+   op_block_jacobi_res_.SetSize(n2);
+   op_block_jacobi_Awork_.SetSize(n2);
+   op_block_jacobi_work_ = 0.0;
+
+   for (int it = 0; it < operator_block_jacobi_smoother_iterations_; it++)
+   {
+      op_->Mult(op_block_jacobi_work_, op_block_jacobi_Awork_);
+      op_block_jacobi_res_ = r;
+      op_block_jacobi_res_.Add(-1.0, op_block_jacobi_Awork_);
+      for (int i = 0; i < n; i++)
+      {
+         const double rr = op_block_jacobi_res_[i];
+         const double ri = op_block_jacobi_res_[i + n];
+         op_block_jacobi_work_[i] +=
+            operator_block_jacobi_smoother_weight_ *
+            (op_block_jacobi_inv00_[i] * rr + op_block_jacobi_inv01_[i] * ri);
+         op_block_jacobi_work_[i + n] +=
+            operator_block_jacobi_smoother_weight_ *
+            (op_block_jacobi_inv10_[i] * rr + op_block_jacobi_inv11_[i] * ri);
+      }
+   }
+
+   z += op_block_jacobi_work_;
+}
+
 void CovariantReferencePreconditioner::Mult(const mfem::Vector &r,
                                             mfem::Vector &z) const
 {
@@ -701,6 +811,7 @@ void CovariantReferencePreconditioner::Mult(const mfem::Vector &r,
          z_i.Add(identity_smoother_weight_, r_i);
       }
       AddOperatorJacobiSmoother(r, z);
+      AddOperatorBlockJacobiSmoother(r, z);
       return;
    }
 
@@ -724,6 +835,7 @@ void CovariantReferencePreconditioner::Mult(const mfem::Vector &r,
       z_i.Add(identity_smoother_weight_, r_i);
    }
    AddOperatorJacobiSmoother(r, z);
+   AddOperatorBlockJacobiSmoother(r, z);
 }
 
 void CovariantReferencePreconditioner::PrintCoarseOperatorDiagnostics(
