@@ -92,6 +92,40 @@ unpreconditioned true residual 早停并报告可信迭代数。
 降低迭代数。当前 PML cheap candidate 应优先使用
 `-npf -sbjac 3.0 -sbjit 1`。
 
+但是 h/p sweep 在 `refine=2, order=3` 暴露了高阶 NURBS 情况下的限制：
+
+| method | params | true-residual result |
+|---|---|---:|
+| none | baseline | 500 iter, rel=3.9966e-03 |
+| AMS | baseline | 500 iter, rel=8.34136e-03 |
+| edge_yee | cps=1, sbjac=3.0 | 500 iter, rel=8.92597e-05 |
+| edge_yee | cps=2, sbjac=4.0 | 500 iter, rel=1.66042e-02 |
+
+`cps=2` increases the auxiliary dofs from `108` to `1176`, i.e. from
+`8.0%` to `87.5%` of the IGA true dofs, but does not improve convergence.
+Therefore the issue is not simply that `cps=1` has too few auxiliary dofs.
+The more likely explanation is that, for cubic NURBS H(curl) with PML, the
+current transfer `Pi` and independent Yee-PML coarse operator no longer match
+the mapped high-order spline error components spectrally.
+
+A coarse-weight ablation at `refine=2, order=3, cps=1, sbjac=3.0` further
+supports this:
+
+| method | coarse weight | final true relative residual |
+|---|---:|---:|
+| smoother only | 0.0 | 8.94034e-05 |
+| edge_yee + smoother | 0.5 | 1.03881e-04 |
+| edge_yee + smoother | 1.0 | 8.92597e-05 |
+| edge_yee + smoother | 2.0 | 8.40382e-05 |
+| edge_galerkin + smoother | 1.0 | 1.37444e-04 |
+
+The Yee/Galerkin coarse correction makes almost no difference at this high-order
+point; the result is dominated by the 2x2 block smoother. This is a negative
+but important result: for `p=3`, simply increasing Yee resolution or coarse
+weight is not enough. The next step is diagnostic comparison of `Pi^T A_h Pi`
+and `A_yee` plus transfer conditioning/column quality, rather than more scalar
+parameter tuning.
+
 4. 因此论文叙事应从“PML 必须 fallback”改成：
 
 ```text
