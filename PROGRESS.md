@@ -82,10 +82,15 @@ unpreconditioned true residual 早停并报告可信迭代数。
 | 2.0 | 160 | 5.34655e-06 | yes |
 | 2.5 | 155 | 7.56862e-06 | yes |
 | 3.0 | 154 | 4.40213e-06 | yes |
+| 3.5 | 154 | 8.86585e-06 | yes |
+| 4.0 | 155 | 7.67582e-06 | yes |
+| 5.0 | 156 | 5.43388e-06 | yes |
+| 6.0 | 157 | 5.99686e-06 | yes |
 
 这说明 block smoother 比 scalar Jacobi 明显更合适：迭代数从约 490
-降到约 154。当前 PML cheap candidate 应优先使用
-`-npf -sbjac 3.0 -sbjit 1`，并继续扫描 `sbjac > 3`。
+降到约 154。`sbjac=3.0-3.5` 附近形成平台，再继续增大权重不会进一步
+降低迭代数。当前 PML cheap candidate 应优先使用
+`-npf -sbjac 3.0 -sbjit 1`。
 
 4. 因此论文叙事应从“PML 必须 fallback”改成：
 
