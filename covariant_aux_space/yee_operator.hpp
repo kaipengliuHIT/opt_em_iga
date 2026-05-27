@@ -30,6 +30,11 @@ public:
    void SetReferencePML(bool enabled, double thickness = 0.25,
                         double strength = 5.0, double order = 2.0);
    bool IsReferencePMLEnabled() const { return pml_enabled_; }
+   void SetComponentScales(double curl_scale, double mass_scale)
+   {
+      curl_scale_ = curl_scale;
+      mass_scale_ = mass_scale;
+   }
 
    const std::vector<YeeEdgeDof> &GetEdgeDofs() const;
    const std::vector<YeeFaceDof> &GetFaceDofs() const;
@@ -74,6 +79,8 @@ private:
    double pml_thickness_ = 0.25;
    double pml_strength_ = 5.0;
    double pml_order_ = 2.0;
+   double curl_scale_ = 1.0;
+   double mass_scale_ = 1.0;
    mutable std::vector<YeeEdgeDof> edge_dofs_;
    mutable std::vector<YeeFaceDof> face_dofs_;
 

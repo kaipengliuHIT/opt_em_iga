@@ -672,6 +672,8 @@ void YeeOperatorBuilder::AssembleYeeMaxwellOperator(
    AssembleYeeCurlOperator(CtMC, k0);
    AssembleYeeMassOperator(eps_fn, K2Meps, k0);
    Ayee = CtMC;
+   Ayee *= curl_scale_;
+   K2Meps *= mass_scale_;
    // Form choice (empirical):
    //   No PML  -> indefinite Maxwell form CtMC - k^2 Meps (matches real A_h
    //              in cavity, ratio ~ 1, edge_yee converges 36-66 iters)

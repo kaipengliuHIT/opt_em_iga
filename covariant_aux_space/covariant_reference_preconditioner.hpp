@@ -41,6 +41,7 @@ public:
    void SetYeeDiagonalCalibration(bool enable) { yee_diag_calibration_ = enable; }
    void SetYeeReferencePML(bool enabled, double thickness = 0.25,
                            double strength = 5.0, double order = 2.0);
+   void SetYeeComponentScales(double curl_scale, double mass_scale);
    void SetYeePMLGalerkinFallback(bool enable)
    { yee_pml_galerkin_fallback_ = enable; MarkDirty(); }
    void SetCoarseCorrectionWeight(double weight)

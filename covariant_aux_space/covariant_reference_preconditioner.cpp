@@ -144,6 +144,13 @@ void CovariantReferencePreconditioner::SetYeeReferencePML(
    MarkDirty();
 }
 
+void CovariantReferencePreconditioner::SetYeeComponentScales(
+   double curl_scale, double mass_scale)
+{
+   yee_operator_->SetComponentScales(curl_scale, mass_scale);
+   MarkDirty();
+}
+
 void CovariantReferencePreconditioner::SetKnotAlignGrid(
    bool enable, int cells_per_span)
 {
