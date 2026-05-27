@@ -805,6 +805,7 @@ void CovariantReferencePreconditioner::Mult(const mfem::Vector &r,
       z_i.MakeRef(z, tvsize, tvsize);
       z_r = z_re_;
       z_i = z_im_;
+      z *= coarse_correction_weight_;
       if (identity_smoother_weight_ != 0.0)
       {
          z_r.Add(identity_smoother_weight_, r_r);
@@ -829,6 +830,7 @@ void CovariantReferencePreconditioner::Mult(const mfem::Vector &r,
    z_i.MakeRef(z, tvsize, tvsize);
    z_r = z_re_;
    z_i = z_im_;
+   z *= coarse_correction_weight_;
    if (identity_smoother_weight_ != 0.0)
    {
       z_r.Add(identity_smoother_weight_, r_r);

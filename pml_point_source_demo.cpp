@@ -227,6 +227,7 @@ int main(int argc, char *argv[])
    bool knot_align = false;
    bool no_pml_fallback = false;
    bool yee_calib = true;
+   real_t coarse_correction_weight = 1.0;
    real_t identity_smoother_weight = 0.0;
    real_t jacobi_smoother_weight = 0.0;
    int jacobi_smoother_iterations = 1;
@@ -276,6 +277,9 @@ int main(int argc, char *argv[])
                   "-no-ycal", "--no-yee-calib",
                   "Calibrate Yee coarse operator diagonal mean to match the "
                   "IGA Galerkin restriction P^T A_h P (mesh-dependent fix).");
+   args.AddOption(&coarse_correction_weight, "-cw", "--coarse-weight",
+                  "Weight multiplying the auxiliary coarse correction "
+                  "Pi Aaux^{-1} Pi^T r. Use 0 for smoother-only ablations.");
    args.AddOption(&identity_smoother_weight, "-sid", "--identity-smoother",
                   "Add beta*I to the auxiliary preconditioner output: "
                   "z = beta*r + Pi Aaux^{-1} Pi^T r.");
@@ -577,6 +581,7 @@ int main(int argc, char *argv[])
       }
       edge_prec->SetGrid({aux_n, aux_n, aux_n});
       edge_prec->SetWaveNumber(omega * sqrt(epsilon * mu));
+      edge_prec->SetCoarseCorrectionWeight(coarse_correction_weight);
       edge_prec->SetIdentitySmootherWeight(identity_smoother_weight);
       edge_prec->SetOperatorJacobiSmootherWeight(jacobi_smoother_weight);
       edge_prec->SetOperatorJacobiSmootherIterations(jacobi_smoother_iterations);

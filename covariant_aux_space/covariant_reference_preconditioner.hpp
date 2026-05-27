@@ -43,6 +43,8 @@ public:
                            double strength = 5.0, double order = 2.0);
    void SetYeePMLGalerkinFallback(bool enable)
    { yee_pml_galerkin_fallback_ = enable; MarkDirty(); }
+   void SetCoarseCorrectionWeight(double weight)
+   { coarse_correction_weight_ = weight; }
    void SetIdentitySmootherWeight(double weight)
    { identity_smoother_weight_ = weight; }
    void SetOperatorJacobiSmootherWeight(double weight)
@@ -112,6 +114,7 @@ private:
    mutable mfem::Vector op_block_jacobi_Awork_;
    bool yee_complex_auxiliary_ = false;
    bool yee_pml_galerkin_fallback_ = true;
+   double coarse_correction_weight_ = 1.0;
    double identity_smoother_weight_ = 0.0;
    double operator_jacobi_smoother_weight_ = 0.0;
    int operator_jacobi_smoother_iterations_ = 1;
