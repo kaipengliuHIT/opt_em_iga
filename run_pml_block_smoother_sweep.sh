@@ -13,7 +13,7 @@ export LD_LIBRARY_PATH=/mnt/f/optemcode/opt/openmpi/lib:/mnt/f/optemcode/opt/hyp
 
 echo "weight,iters,gmres_converged,true_converged,true_rel_res,aux_dofs,true_dofs" > "$OUTFILE"
 
-for W in 0.3 0.5 0.8 1.0 1.2 1.5 2.0 2.5 3.0; do
+for W in 0.8 1.0 1.2 1.5 2.0 2.5 3.0 3.5 4.0 5.0 6.0; do
     echo "--- edge_yee pure Yee-PML sbjac=$W ---"
     out=$("$REPO/pml_point_source_demo" \
         -m "$MESH" \

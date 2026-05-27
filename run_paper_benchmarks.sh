@@ -62,6 +62,7 @@ run_one pml $MESH 2 2 "-prec edge_galerkin -ka -cps 1" 200
 run_one pml $MESH 2 2 "-prec edge_yee -ka -cps 1 -npf" 500
 run_one pml $MESH 2 2 "-prec edge_yee -ka -cps 1 -npf -sjac 2.5 -sjit 1" 500
 run_one pml $MESH 2 2 "-prec edge_yee -ka -cps 1 -npf -sjac 3.0 -sjit 1" 500
+run_one pml $MESH 2 2 "-prec edge_yee -ka -cps 1 -npf -sbjac 3.0 -sbjit 1" 300
 run_one pml $MESH 2 2 "-prec edge_yee -ka -cps 1" 200
 echo ""
 

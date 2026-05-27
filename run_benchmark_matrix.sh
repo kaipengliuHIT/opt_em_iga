@@ -73,6 +73,7 @@ run_pml 2 2 edge_galerkin "-ka -cps 1" 200 "ka_cps1"
 run_pml 2 2 edge_yee "-ka -cps 1 -npf" 500 "ka_cps1_nopf"
 run_pml 2 2 edge_yee "-ka -cps 1 -npf -sjac 2.5 -sjit 1" 500 "ka_cps1_nopf_sjac25"
 run_pml 2 2 edge_yee "-ka -cps 1 -npf -sjac 3.0 -sjit 1" 500 "ka_cps1_nopf_sjac30"
+run_pml 2 2 edge_yee "-ka -cps 1 -npf -sbjac 3.0 -sbjit 1" 300 "ka_cps1_nopf_sbjac30"
 # Galerkin fallback remains a diagnostic upper-bound path, not the cheap method.
 run_pml 2 2 edge_yee "-ka -cps 1" 200 "ka_cps1_fb"
 

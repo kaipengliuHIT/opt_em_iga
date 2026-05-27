@@ -30,7 +30,7 @@ M^{-1} r = S^{-1} r + Pi A_yee,PML^{-1} Pi^T r
 smoother。只用低秩 coarse correction 会让 MFEM 的预条件残差看似收敛，
 但 true residual 仍然很大。
 
-3. 当前最有希望的 smoother 是一阶 operator-Jacobi：
+3. 标量一阶 operator-Jacobi 是第一个可行 smoother：
 
 ```text
 S^{-1} r = omega diag(A_h)^{-1} r
@@ -59,6 +59,33 @@ S^{-1} r = omega diag(A_h)^{-1} r
 但是该 sweep 使用的是 MFEM 默认停止准则，所有条目都跑到 `gmi=500`；
 因此已经新增 `-trc/--true-residual-control`，让 PML benchmark 可以按
 unpreconditioned true residual 早停并报告可信迭代数。
+
+进一步加入 2x2 real/imag block Jacobi smoother 后，PML cheap path 明显改善。
+这个 smoother 对每个复自由度反演实数块系统中的局部
+
+```text
+[ real-real   imag-to-real ]
+[ real-to-imag imag-imag  ]
+```
+
+对角块，因此保留了 PML 复系数造成的同点实部/虚部耦合。用户在同一
+`cube-nurbs.mesh, order=2, refine=2, freq=4.0, knot-align cps=1` 测得：
+
+| `sbjac` | true-residual iterations | final true relative residual | true converged |
+|---:|---:|---:|---:|
+| 0.3 | 198 | 2.31381e-05 | no |
+| 0.5 | 307 | 1.56854e-05 | no |
+| 0.8 | 174 | 1.30012e-05 | no |
+| 1.0 | 170 | 7.09493e-06 | yes |
+| 1.2 | 169 | 1.10239e-05 | no |
+| 1.5 | 166 | 5.22694e-06 | yes |
+| 2.0 | 160 | 5.34655e-06 | yes |
+| 2.5 | 155 | 7.56862e-06 | yes |
+| 3.0 | 154 | 4.40213e-06 | yes |
+
+这说明 block smoother 比 scalar Jacobi 明显更合适：迭代数从约 490
+降到约 154。当前 PML cheap candidate 应优先使用
+`-npf -sbjac 3.0 -sbjit 1`，并继续扫描 `sbjac > 3`。
 
 4. 因此论文叙事应从“PML 必须 fallback”改成：
 
