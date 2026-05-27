@@ -15,7 +15,7 @@ run_one() {
     if [ "$PROG" = "cavity" ]; then
         out=$($REPO/minimal_demo -m $M -r $R -o $O -wl 0.2 $EXTRA -gmi $GMI 2>&1)
     else
-        out=$($REPO/pml_point_source_demo -m $M -r $R -o $O -f 4.0 $EXTRA -gmi $GMI -no-vis 2>&1)
+        out=$($REPO/pml_point_source_demo -m $M -r $R -o $O -f 4.0 $EXTRA -trc -gmi $GMI -no-vis 2>&1)
     fi
     local done_line=$(echo "$out" | grep "GMRES.*done" | tail -n 1)
     local iters=$(echo "$done_line" | sed -n 's/.*iters=\([^, ]*\).*/\1/p')

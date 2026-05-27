@@ -30,6 +30,7 @@
 #include <sstream>
 #include <iomanip>
 #include <memory>
+#include <limits>
 
 using namespace std;
 using namespace mfem;
@@ -104,6 +105,73 @@ public:
       (*Function)(transip, pml, K);
    }
 };
+
+class TrueResidualController : public IterativeSolverController
+{
+private:
+   const Operator &A_;
+   const Vector &B_;
+   const real_t bnorm_;
+   const real_t rel_tol_;
+   const real_t abs_tol_;
+   const int print_every_;
+   const int rank_;
+   mutable Vector residual_;
+   int last_iter_ = -1;
+   real_t last_norm_ = numeric_limits<real_t>::infinity();
+   real_t last_rel_ = numeric_limits<real_t>::infinity();
+
+public:
+   TrueResidualController(const Operator &A, const Vector &B,
+                          real_t bnorm, real_t rel_tol, real_t abs_tol,
+                          int print_every, int rank)
+      : A_(A), B_(B), bnorm_(bnorm), rel_tol_(rel_tol), abs_tol_(abs_tol),
+        print_every_(print_every), rank_(rank)
+   {
+      residual_.SetSize(B.Size());
+   }
+
+   bool RequiresUpdatedSolution() const override { return true; }
+
+   void Reset() override
+   {
+      IterativeSolverController::Reset();
+      last_iter_ = -1;
+      last_norm_ = numeric_limits<real_t>::infinity();
+      last_rel_ = numeric_limits<real_t>::infinity();
+   }
+
+   void MonitorSolution(int it, real_t, const Vector &x, bool final) override
+   {
+      A_.Mult(x, residual_);
+      residual_ *= -1.0;
+      residual_ += B_;
+      last_iter_ = it;
+      last_norm_ = residual_.Norml2();
+      last_rel_ = (bnorm_ > 0.0) ? last_norm_ / bnorm_ : last_norm_;
+
+      const bool true_stop =
+         (bnorm_ > 0.0) ? (last_rel_ <= rel_tol_) : (last_norm_ <= abs_tol_);
+      if (true_stop)
+      {
+         converged = true;
+      }
+
+      if (rank_ == 0 && print_every_ > 0 &&
+          (final || true_stop || it == 0 || it % print_every_ == 0))
+      {
+         cout << "[true-residual monitor] iter=" << it
+              << " ||r||=" << last_norm_;
+         if (bnorm_ > 0.0) { cout << " (rel=" << last_rel_ << ")"; }
+         cout << ", true_converged=" << true_stop << '\n';
+      }
+   }
+
+   int LastIter() const { return last_iter_; }
+   real_t LastNorm() const { return last_norm_; }
+   real_t LastRel() const { return last_rel_; }
+};
+
 template <typename T> T pow2(const T &x) { return x*x; }
 void maxwell_solution(const Vector &x, vector<complex<real_t>> &Eval);
 
@@ -162,6 +230,8 @@ int main(int argc, char *argv[])
    real_t identity_smoother_weight = 0.0;
    real_t jacobi_smoother_weight = 0.0;
    int jacobi_smoother_iterations = 1;
+   bool true_residual_control = false;
+   int true_residual_print_every = 0;
 
    OptionsParser args(argc, argv);
    args.AddOption(&mesh_file, "-m", "--mesh",
@@ -211,6 +281,13 @@ int main(int argc, char *argv[])
                   "Add omega*diag(A)^{-1}r to the auxiliary preconditioner output.");
    args.AddOption(&jacobi_smoother_iterations, "-sjit", "--jacobi-smoother-iters",
                   "Number of weighted Jacobi smoothing iterations.");
+   args.AddOption(&true_residual_control, "-trc", "--true-residual-control",
+                  "-no-trc", "--no-true-residual-control",
+                  "Stop GMRES using the unpreconditioned true residual norm.");
+   args.AddOption(&true_residual_print_every, "-trp",
+                  "--true-residual-print-every",
+                  "Print true residual every N iterations when -trc is enabled "
+                  "(0=only final summary).");
    args.AddOption(&pa, "-pa", "--partial-assembly", "-no-pa",
                   "--no-partial-assembly", "Enable Partial Assembly.");
    args.AddOption(&device_config, "-d", "--device",
@@ -584,6 +661,21 @@ int main(int argc, char *argv[])
            << " start ||r0||=" << r0;
       if (bnorm > 0.0) { cout << " (rel=" << r0 / bnorm << ")"; }
       cout << endl;
+      if (true_residual_control)
+      {
+         cout << "[PML GMRES] true residual controller enabled"
+              << " (rel_tol=" << gmres_rel_tol << ")\n";
+      }
+   }
+
+   unique_ptr<TrueResidualController> true_controller;
+   if (true_residual_control)
+   {
+      true_controller.reset(new TrueResidualController(*A, B, bnorm,
+                                                       gmres_rel_tol, 0.0,
+                                                       true_residual_print_every,
+                                                       myid));
+      gmres.SetController(*true_controller);
    }
 
    gmres.Mult(B, X);

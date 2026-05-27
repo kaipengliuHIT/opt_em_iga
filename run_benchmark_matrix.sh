@@ -31,7 +31,7 @@ run_cavity() {
 run_pml() {
     local R=$1 O=$2 PREC=$3 PARAMS=$4 GMI=$5 LABEL=$6
     echo "--- pml r=$R o=$O $PREC $LABEL ---"
-    local out=$($REPO/pml_point_source_demo -m $MESH -r $R -o $O -f 4.0 -prec $PREC $PARAMS -gmi $GMI -no-vis 2>&1)
+    local out=$($REPO/pml_point_source_demo -m $MESH -r $R -o $O -f 4.0 -prec $PREC $PARAMS -trc -gmi $GMI -no-vis 2>&1)
     local done_line=$(echo "$out" | grep "GMRES.*done" | tail -n 1)
     local iters=$(echo "$done_line" | sed -n 's/.*iters=\([^, ]*\).*/\1/p')
     local conv=$(echo "$done_line" | sed -n 's/.*, converged=\([^, ]*\).*/\1/p')

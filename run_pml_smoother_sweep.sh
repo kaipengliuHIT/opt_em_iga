@@ -22,6 +22,7 @@ for W in 1.2 1.5 1.8 2.0 2.3 2.5 2.8 3.0 3.3 3.5; do
         -ka -cps 1 \
         -npf \
         -sjac "$W" -sjit 1 \
+        -trc \
         -gmi 500 -gpl 0 -grt 1e-5 \
         -no-vis 2>&1)
 

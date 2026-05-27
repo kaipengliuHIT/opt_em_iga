@@ -40,6 +40,26 @@ S^{-1} r = omega diag(A_h)^{-1} r
 用户已测到 `omega=2.5` 和 `omega=3.0` 可以把 true residual 压到
 `1e-5` 附近或以下；多步 Jacobi (`-sjit > 1`) 反而不稳定。
 
+最新一维 smoother sweep 进一步显示有效窗口是连续的：
+
+| `sjac` | final true relative residual | true converged |
+|---:|---:|---:|
+| 1.2 | 4.65132e-05 | no |
+| 1.5 | 2.65527e-05 | no |
+| 1.8 | 5.64806e-05 | no |
+| 2.0 | 1.69818e-03 | no |
+| 2.3 | 6.99197e-06 | yes |
+| 2.5 | 8.67417e-06 | yes |
+| 2.8 | 8.49169e-06 | yes |
+| 3.0 | 8.95023e-06 | yes |
+| 3.3 | 9.95635e-06 | yes |
+| 3.5 | 1.19109e-05 | no |
+
+这说明 `sjac≈2.3-3.3` 是一个真实窗口，而不是单个调参点。
+但是该 sweep 使用的是 MFEM 默认停止准则，所有条目都跑到 `gmi=500`；
+因此已经新增 `-trc/--true-residual-control`，让 PML benchmark 可以按
+unpreconditioned true residual 早停并报告可信迭代数。
+
 4. 因此论文叙事应从“PML 必须 fallback”改成：
 
 ```text
