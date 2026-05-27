@@ -1,16 +1,15 @@
 # Makefile for SOI waveguide simulation
 
-# MFEM build configuration (use cuda build for GPU support)
-MFEM_BUILD_DIR = /mnt/d/code/code_opt_em/mfem-cuda-build
-MFEM_SRC_DIR = /mnt/d/code/code_opt_em/mfem
+# MFEM build configuration. Override these on the make command line if needed.
+WORKSPACE_DIR ?= /mnt/f/optemcode
+MFEM_BUILD_DIR ?= $(WORKSPACE_DIR)/mfem-cpu-build
+MFEM_SRC_DIR ?= $(WORKSPACE_DIR)/mfem
 include $(MFEM_BUILD_DIR)/config/config.mk
 
-OPT_DIR = /mnt/d/code/code_opt_em/opt
+OPT_DIR ?= $(WORKSPACE_DIR)/opt
 MFEM_TPLFLAGS = -I$(OPT_DIR)/hypre/include -I$(OPT_DIR)/metis/include -I$(OPT_DIR)/openmpi/include
 MFEM_EXT_LIBS = -Wl,-rpath,$(OPT_DIR)/hypre/lib -L$(OPT_DIR)/hypre/lib -lHYPRE \
                 $(OPT_DIR)/metis/lib/libmetis.a \
-                -Wl,-rpath,/usr/lib/x86_64-linux-gnu -L/usr/lib/x86_64-linux-gnu -lcusparse \
-                -Wl,-rpath,/usr/lib/x86_64-linux-gnu -L/usr/lib/x86_64-linux-gnu -lcublas \
                 -Wl,-rpath,$(OPT_DIR)/openmpi/lib -L$(OPT_DIR)/openmpi/lib -lmpi
 
 # CUDA and cuDSS paths
@@ -24,7 +23,7 @@ DEBUG_CXXFLAGS = -std=c++17 -O0 -g -I$(MFEM_SRC_DIR) -I$(MFEM_BUILD_DIR) -I$(MFE
 
 # Linker flags (directly link to CUDA 12 version of cuDSS)
 LDFLAGS = -L$(MFEM_BUILD_DIR) -lmfem $(MFEM_EXT_LIBS) -L$(CUDA_DIR)/lib64 -lcudart -lcublas -lcublasLt -Wl,-rpath,$(CUDSS_LIB_DIR) $(CUDSS_LIB_DIR)/libcudss.so.0.7.1
-LDFLAGS_NO_CUDSS = -L$(MFEM_BUILD_DIR) -lmfem $(MFEM_EXT_LIBS) -L$(CUDA_DIR)/lib64 -lcudart -lcublas -lcublasLt \
+LDFLAGS_NO_CUDSS = -L$(MFEM_BUILD_DIR) -lmfem $(MFEM_EXT_LIBS) \
                    -Wl,-rpath,$(OPT_DIR)/openmpi/lib -Wl,-rpath,$(OPT_DIR)/hypre/lib
 
 # Target executables
@@ -391,3 +390,34 @@ test_point_source: test_point_source.o em_opt/cudss_mpi_solver.o
 
 test_point_source.o: test_point_source.cpp em_opt/pml_coefficients.hpp em_opt/cudss_mpi_solver.hpp
 	$(CXX) $(CXXFLAGS) -I./em_opt -c test_point_source.cpp -o test_point_source.o
+
+# NURBS 3D point-source PML demo for AMS vs edge-Yee comparison
+pml_point_source_demo: \
+	pml_point_source_demo.o \
+	covariant_aux_space/yee_transfer.o \
+	covariant_aux_space/yee_operator.o \
+	covariant_aux_space/covariant_reference_preconditioner.o \
+	fdfd_iga_init/reference_fdfd_cpu.o \
+	fdfd_iga_init/reference_initial_guess.o
+	$(CXX) $(CXXFLAGS) -I./fdfd_iga_init -I./covariant_aux_space -o pml_point_source_demo $^ $(LDFLAGS_NO_CUDSS)
+
+pml_point_source_demo.o: \
+	pml_point_source_demo.cpp \
+	fdfd_iga_init/reference_patch_evaluator.hpp \
+	covariant_aux_space/covariant_reference_preconditioner.hpp
+	$(CXX) $(CXXFLAGS) -I./fdfd_iga_init -I./covariant_aux_space -c pml_point_source_demo.cpp -o $@
+
+# ── Minimal demo with factory interface ──────────────────────────────
+minimal_demo: fdfd_iga_init/minimal_demo.o \
+	fdfd_iga_init/reference_fdfd_cpu.o \
+	fdfd_iga_init/reference_initial_guess.o \
+	covariant_aux_space/yee_transfer.o \
+	covariant_aux_space/yee_operator.o \
+	covariant_aux_space/covariant_reference_preconditioner.o
+	$(CXX) $(CXXFLAGS) -I./fdfd_iga_init -I./covariant_aux_space -o $@ $^ $(LDFLAGS_NO_CUDSS)
+
+fdfd_iga_init/minimal_demo.o: fdfd_iga_init/minimal_demo.cpp \
+	fdfd_iga_init/reference_fdfd_cpu.hpp \
+	fdfd_iga_init/reference_patch_evaluator.hpp \
+	covariant_aux_space/covariant_preconditioner_factory.hpp
+	$(CXX) $(CXXFLAGS) -I./fdfd_iga_init -I./covariant_aux_space -c $< -o $@

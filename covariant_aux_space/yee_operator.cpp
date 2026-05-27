@@ -1,4 +1,5 @@
 #include "yee_operator.hpp"
+#include <complex>
 #include <limits>
 
 namespace covariant_aux_space
@@ -122,12 +123,21 @@ double PhysicalEdgeMetric(const mfem::DenseMatrix &J, int axis)
 
 double PhysicalFaceMetric(const mfem::DenseMatrix &J, int axis)
 {
-   mfem::DenseMatrix invJ = J;
-   invJ.Invert();
-   const double nx = invJ(axis, 0);
-   const double ny = invJ(axis, 1);
-   const double nz = invJ(axis, 2);
-   return J.Det() * std::sqrt(nx * nx + ny * ny + nz * nz);
+   // Compute |J * (e_b × e_c)| = |col_b × col_c|  (cross-product formula)
+   // This avoids matrix inversion which can fail for degenerate Jacobians.
+   // For face normal along `axis`, the area is the magnitude of the
+   // cross product of the two columns of J orthogonal to `axis`.
+   const int b = (axis + 1) % 3;
+   const int c = (axis + 2) % 3;
+   const double cb0 = J(0, b), cb1 = J(1, b), cb2 = J(2, b);
+   const double cc0 = J(0, c), cc1 = J(1, c), cc2 = J(2, c);
+   const double cx = cb1 * cc2 - cb2 * cc1;
+   const double cy = cb2 * cc0 - cb0 * cc2;
+   const double cz = cb0 * cc1 - cb1 * cc0;
+   const double area = std::sqrt(cx * cx + cy * cy + cz * cz);
+   // Guard against NaN from degenerate geometry
+   if (!std::isfinite(area) || area < 1e-30) { return 0.0; }
+   return area;
 }
 
 } // namespace
@@ -138,11 +148,75 @@ YeeOperatorBuilder::YeeOperatorBuilder(
 {
 }
 
+
+// ── Non-uniform grid helpers ──────────────────────────────────────────
+namespace {
+
+/// Compute position of a Yee node/edge/face center using knot positions.
+/// When grid is uniform, falls back to i * h.
+struct GridMapper
+{
+   const fdfd_iga_init::ReferenceGrid &grid;
+   bool has_knots;
+
+   GridMapper(const fdfd_iga_init::ReferenceGrid &g)
+      : grid(g), has_knots(!g.knot_x.empty()) {}
+
+   double node_x(int i) const {
+      return has_knots ? grid.knot_x[i] : double(i) / (grid.nx - 1);
+   }
+   double node_y(int j) const {
+      return has_knots ? grid.knot_y[j] : double(j) / (grid.ny - 1);
+   }
+   double node_z(int k) const {
+      return has_knots ? grid.knot_z[k] : double(k) / (grid.nz - 1);
+   }
+
+   /// Edge center in param space (midpoint between two nodes)
+   double edge_x(int i) const {
+      return has_knots ? 0.5 * (grid.knot_x[i] + grid.knot_x[i+1])
+                       : (i + 0.5) / (grid.nx - 1);
+   }
+   double edge_y(int j) const {
+      return has_knots ? 0.5 * (grid.knot_y[j] + grid.knot_y[j+1])
+                       : (j + 0.5) / (grid.ny - 1);
+   }
+   double edge_z(int k) const {
+      return has_knots ? 0.5 * (grid.knot_z[k] + grid.knot_z[k+1])
+                       : (k + 0.5) / (grid.nz - 1);
+   }
+
+   /// Cell width (h) at index i
+   double cell_hx(int i) const {
+      return has_knots ? (grid.knot_x[i+1] - grid.knot_x[i])
+                       : 1.0 / (grid.nx - 1);
+   }
+   double cell_hy(int j) const {
+      return has_knots ? (grid.knot_y[j+1] - grid.knot_y[j])
+                       : 1.0 / (grid.ny - 1);
+   }
+   double cell_hz(int k) const {
+      return has_knots ? (grid.knot_z[k+1] - grid.knot_z[k])
+                       : 1.0 / (grid.nz - 1);
+   }
+};
+
+} // namespace
+
 void YeeOperatorBuilder::SetGrid(const fdfd_iga_init::ReferenceGrid &grid)
 {
    grid_ = grid;
    edge_dofs_.clear();
    face_dofs_.clear();
+}
+
+void YeeOperatorBuilder::SetReferencePML(bool enabled, double thickness,
+                                         double strength, double order)
+{
+   pml_enabled_ = enabled;
+   pml_thickness_ = thickness;
+   pml_strength_ = strength;
+   pml_order_ = order;
 }
 
 const std::vector<YeeEdgeDof> &YeeOperatorBuilder::GetEdgeDofs() const
@@ -303,6 +377,74 @@ int YeeOperatorBuilder::XYFaceIndex(int i, int j, int k) const
           (k - 1) * (grid_.ny - 1) * (grid_.nx - 1) + j * (grid_.nx - 1) + i;
 }
 
+std::complex<double> YeeOperatorBuilder::StretchFactor(double xi, double k0) const
+{
+   if (!pml_enabled_ || pml_thickness_ <= 0.0 || k0 <= 0.0)
+   {
+      return {1.0, 0.0};
+   }
+
+   double d = 0.0;
+   if (xi < pml_thickness_)
+   {
+      d = pml_thickness_ - xi;
+   }
+   else if (xi > 1.0 - pml_thickness_)
+   {
+      d = xi - (1.0 - pml_thickness_);
+   }
+
+   if (d <= 0.0)
+   {
+      return {1.0, 0.0};
+   }
+
+   const double n = pml_order_;
+   const double coeff = n * pml_strength_ / k0 / std::pow(pml_thickness_, n);
+   const double sigma = coeff * std::pow(d, n - 1.0);
+   return {1.0, sigma};
+}
+
+double YeeOperatorBuilder::PMLCurlWeight(const mfem::Vector &xi, int axis,
+                                         double k0) const
+{
+   return std::abs(PMLCurlWeightComplex(xi, axis, k0));
+}
+
+double YeeOperatorBuilder::PMLMassWeight(const mfem::Vector &xi, int axis,
+                                         double k0) const
+{
+   return std::abs(PMLMassWeightComplex(xi, axis, k0));
+}
+
+std::complex<double> YeeOperatorBuilder::PMLCurlWeightComplex(
+   const mfem::Vector &xi, int axis, double k0) const
+{
+   if (!pml_enabled_) { return {1.0, 0.0}; }
+   std::complex<double> s[3] =
+   {
+      StretchFactor(xi[0], k0),
+      StretchFactor(xi[1], k0),
+      StretchFactor(xi[2], k0)
+   };
+   const std::complex<double> det = s[0] * s[1] * s[2];
+   return (s[axis] * s[axis]) / det;
+}
+
+std::complex<double> YeeOperatorBuilder::PMLMassWeightComplex(
+   const mfem::Vector &xi, int axis, double k0) const
+{
+   if (!pml_enabled_) { return {1.0, 0.0}; }
+   std::complex<double> s[3] =
+   {
+      StretchFactor(xi[0], k0),
+      StretchFactor(xi[1], k0),
+      StretchFactor(xi[2], k0)
+   };
+   const std::complex<double> det = s[0] * s[1] * s[2];
+   return det / (s[axis] * s[axis]);
+}
+
 void YeeOperatorBuilder::BuildCurlIncidence(mfem::DenseMatrix &C) const
 {
    BuildEdgeDofs();
@@ -352,16 +494,77 @@ void YeeOperatorBuilder::BuildCurlIncidence(mfem::DenseMatrix &C) const
    }
 }
 
-void YeeOperatorBuilder::AssembleFaceMassMuInv(mfem::DenseMatrix &MmuInv) const
+void YeeOperatorBuilder::BuildCurlIncidenceComplex(double k0,
+                                                   mfem::DenseMatrix &Creal,
+                                                   mfem::DenseMatrix &Cimag) const
+{
+   BuildEdgeDofs();
+   BuildFaceDofs();
+
+   const int ne = static_cast<int>(edge_dofs_.size());
+   const int nf = static_cast<int>(face_dofs_.size());
+   Creal.SetSize(nf, ne);
+   Cimag.SetSize(nf, ne);
+   Creal = 0.0;
+   Cimag = 0.0;
+
+   GridMapper map(grid_);
+   mfem::Vector xi(3);
+
+   auto add_entry = [&](int row, int col, double sign, int deriv_axis)
+   {
+      if (col < 0) { return; }
+      const std::complex<double> inv_s =
+         1.0 / StretchFactor(xi[deriv_axis], k0);
+      Creal(row, col) += sign * inv_s.real();
+      Cimag(row, col) += sign * inv_s.imag();
+   };
+
+   for (int row = 0; row < nf; row++)
+   {
+      const auto &f = face_dofs_[row];
+      if (f.axis == 0)
+      {
+         xi[0] = map.node_x(f.i);
+         xi[1] = map.edge_y(f.j);
+         xi[2] = map.edge_z(f.k);
+         add_entry(row, ZEdgeIndex(f.i, f.j, f.k), -1.0, 1);
+         add_entry(row, ZEdgeIndex(f.i, f.j + 1, f.k), 1.0, 1);
+         add_entry(row, YEdgeIndex(f.i, f.j, f.k), 1.0, 2);
+         add_entry(row, YEdgeIndex(f.i, f.j, f.k + 1), -1.0, 2);
+      }
+      else if (f.axis == 1)
+      {
+         xi[0] = map.edge_x(f.i);
+         xi[1] = map.node_y(f.j);
+         xi[2] = map.edge_z(f.k);
+         add_entry(row, XEdgeIndex(f.i, f.j, f.k), 1.0, 2);
+         add_entry(row, XEdgeIndex(f.i, f.j, f.k + 1), -1.0, 2);
+         add_entry(row, ZEdgeIndex(f.i, f.j, f.k), 1.0, 0);
+         add_entry(row, ZEdgeIndex(f.i + 1, f.j, f.k), -1.0, 0);
+      }
+      else
+      {
+         xi[0] = map.edge_x(f.i);
+         xi[1] = map.edge_y(f.j);
+         xi[2] = map.node_z(f.k);
+         add_entry(row, YEdgeIndex(f.i, f.j, f.k), -1.0, 0);
+         add_entry(row, YEdgeIndex(f.i + 1, f.j, f.k), 1.0, 0);
+         add_entry(row, XEdgeIndex(f.i, f.j, f.k), -1.0, 1);
+         add_entry(row, XEdgeIndex(f.i, f.j + 1, f.k), 1.0, 1);
+      }
+   }
+}
+
+void YeeOperatorBuilder::AssembleFaceMassMuInv(mfem::DenseMatrix &MmuInv,
+                                               double k0) const
 {
    BuildFaceDofs();
    const int nf = static_cast<int>(face_dofs_.size());
    MmuInv.SetSize(nf, nf);
    MmuInv = 0.0;
 
-   const double hx = 1.0 / double(grid_.nx - 1);
-   const double hy = 1.0 / double(grid_.ny - 1);
-   const double hz = 1.0 / double(grid_.nz - 1);
+   GridMapper map(grid_);
    mfem::Vector xi(3), x_phys;
    mfem::DenseMatrix J;
    for (int row = 0; row < nf; row++)
@@ -369,46 +572,53 @@ void YeeOperatorBuilder::AssembleFaceMassMuInv(mfem::DenseMatrix &MmuInv) const
       const auto &f = face_dofs_[row];
       if (f.axis == 0)
       {
-         xi[0] = f.i * hx;
-         xi[1] = (f.j + 0.5) * hy;
-         xi[2] = (f.k + 0.5) * hz;
+         xi[0] = map.node_x(f.i);
+         xi[1] = map.edge_y(f.j);
+         xi[2] = map.edge_z(f.k);
       }
       else if (f.axis == 1)
       {
-         xi[0] = (f.i + 0.5) * hx;
-         xi[1] = f.j * hy;
-         xi[2] = (f.k + 0.5) * hz;
+         xi[0] = map.edge_x(f.i);
+         xi[1] = map.node_y(f.j);
+         xi[2] = map.edge_z(f.k);
       }
       else
       {
-         xi[0] = (f.i + 0.5) * hx;
-         xi[1] = (f.j + 0.5) * hy;
-         xi[2] = f.k * hz;
+         xi[0] = map.edge_x(f.i);
+         xi[1] = map.edge_y(f.j);
+         xi[2] = map.node_z(f.k);
       }
       geom_.EvalGeometry(xi, x_phys, J);
 
-      const double h_axis = (f.axis == 0) ? hx : ((f.axis == 1) ? hy : hz);
-      const double area_ref = (f.axis == 0) ? (hy * hz)
-                            : (f.axis == 1) ? (hx * hz)
-                                            : (hx * hy);
+      const double h_axis = (f.axis == 0) ? map.cell_hx(f.i)
+                          : (f.axis == 1) ? map.cell_hy(f.j)
+                                          : map.cell_hz(f.k);
+      const double h_orth1 = (f.axis == 0) ? map.cell_hy(f.j)
+                           : (f.axis == 1) ? map.cell_hx(f.i)
+                                           : map.cell_hx(f.i);
+      const double h_orth2 = (f.axis == 0) ? map.cell_hz(f.k)
+                           : (f.axis == 1) ? map.cell_hz(f.k)
+                                           : map.cell_hy(f.j);
+      const double area_ref = h_orth1 * h_orth2;
       const double dual_edge = PhysicalEdgeMetric(J, f.axis) * h_axis;
       const double primal_face = PhysicalFaceMetric(J, f.axis) * area_ref;
-      MmuInv(row, row) = (primal_face > 0.0) ? (dual_edge / primal_face) : 0.0;
+      const double pml_weight = PMLCurlWeight(xi, f.axis, k0);
+      MmuInv(row, row) = (primal_face > 0.0) ?
+                         (pml_weight * dual_edge / primal_face) : 0.0;
    }
 }
 
 void YeeOperatorBuilder::AssembleEdgeMassEps(
    const std::function<double(const mfem::Vector &)> &eps_fn,
-   mfem::DenseMatrix &Meps) const
+   mfem::DenseMatrix &Meps,
+   double k0) const
 {
    BuildEdgeDofs();
    const int ne = static_cast<int>(edge_dofs_.size());
    Meps.SetSize(ne, ne);
    Meps = 0.0;
 
-   const double hx = 1.0 / double(grid_.nx - 1);
-   const double hy = 1.0 / double(grid_.ny - 1);
-   const double hz = 1.0 / double(grid_.nz - 1);
+   GridMapper map(grid_);
    mfem::Vector xi(3), x_phys;
    mfem::DenseMatrix J;
    for (int row = 0; row < ne; row++)
@@ -416,32 +626,40 @@ void YeeOperatorBuilder::AssembleEdgeMassEps(
       const auto &e = edge_dofs_[row];
       if (e.axis == 0)
       {
-         xi[0] = (e.i + 0.5) * hx;
-         xi[1] = e.j * hy;
-         xi[2] = e.k * hz;
+         xi[0] = map.edge_x(e.i);
+         xi[1] = map.node_y(e.j);
+         xi[2] = map.node_z(e.k);
       }
       else if (e.axis == 1)
       {
-         xi[0] = e.i * hx;
-         xi[1] = (e.j + 0.5) * hy;
-         xi[2] = e.k * hz;
+         xi[0] = map.node_x(e.i);
+         xi[1] = map.edge_y(e.j);
+         xi[2] = map.node_z(e.k);
       }
       else
       {
-         xi[0] = e.i * hx;
-         xi[1] = e.j * hy;
-         xi[2] = (e.k + 0.5) * hz;
+         xi[0] = map.node_x(e.i);
+         xi[1] = map.node_y(e.j);
+         xi[2] = map.edge_z(e.k);
       }
       geom_.EvalGeometry(xi, x_phys, J);
 
-      const double h_axis = (e.axis == 0) ? hx : ((e.axis == 1) ? hy : hz);
-      const double area_ref = (e.axis == 0) ? (hy * hz)
-                            : (e.axis == 1) ? (hx * hz)
-                                            : (hx * hy);
+      const double h_axis = (e.axis == 0) ? map.cell_hx(e.i)
+                          : (e.axis == 1) ? map.cell_hy(e.j)
+                                          : map.cell_hz(e.k);
+      const double h_orth1 = (e.axis == 0) ? map.cell_hy(e.j)
+                           : (e.axis == 1) ? map.cell_hx(e.i)
+                                           : map.cell_hx(e.i);
+      const double h_orth2 = (e.axis == 0) ? map.cell_hz(e.k)
+                           : (e.axis == 1) ? map.cell_hz(e.k)
+                                           : map.cell_hy(e.j);
+      const double area_ref = h_orth1 * h_orth2;
       const double primal_edge = PhysicalEdgeMetric(J, e.axis) * h_axis;
       const double dual_face = PhysicalFaceMetric(J, e.axis) * area_ref;
       const double eps = eps_fn(x_phys);
-      Meps(row, row) = (primal_edge > 0.0) ? (eps * dual_face / primal_edge) : 0.0;
+      const double pml_weight = PMLMassWeight(xi, e.axis, k0);
+      Meps(row, row) = (primal_edge > 0.0) ?
+                       (pml_weight * eps * dual_face / primal_edge) : 0.0;
    }
 }
 
@@ -450,12 +668,31 @@ void YeeOperatorBuilder::AssembleYeeMaxwellOperator(
    double k0,
    mfem::DenseMatrix &Ayee) const
 {
-   mfem::DenseMatrix C, MmuInv, Meps;
-   BuildCurlIncidence(C);
-   AssembleFaceMassMuInv(MmuInv);
-   AssembleEdgeMassEps(eps_fn, Meps);
+   mfem::DenseMatrix CtMC, K2Meps;
+   AssembleYeeCurlOperator(CtMC, k0);
+   AssembleYeeMassOperator(eps_fn, K2Meps, k0);
+   Ayee = CtMC;
+   // Form choice (empirical):
+   //   No PML  -> indefinite Maxwell form CtMC - k^2 Meps (matches real A_h
+   //              in cavity, ratio ~ 1, edge_yee converges 36-66 iters)
+   //   PML on  -> ex25p-style PD-like form CtMC + k^2 Meps (matches the abs
+   //              prec target that GMRES actually prefers; using the indefinite
+   //              form here makes GMRES stall on PML meshes).
+   // The two regimes converge to different effective preconditioners; the
+   // diagnostics in PrintYeeGalerkinComparison report against both targets.
+   const double mass_sign = pml_enabled_ ? 1.0 : -1.0;
+   if (mass_sign > 0.0) { Ayee += K2Meps; }
+   else                 { Ayee -= K2Meps; }
+}
 
-   mfem::DenseMatrix CtMC(C.Width(), C.Width());
+void YeeOperatorBuilder::AssembleYeeCurlOperator(mfem::DenseMatrix &CtMC,
+                                                 double k0) const
+{
+   mfem::DenseMatrix C, MmuInv;
+   BuildCurlIncidence(C);
+   AssembleFaceMassMuInv(MmuInv, k0);
+
+   CtMC.SetSize(C.Width(), C.Width());
    CtMC = 0.0;
    for (int f = 0; f < C.Height(); f++)
    {
@@ -473,15 +710,58 @@ void YeeOperatorBuilder::AssembleYeeMaxwellOperator(
          }
       }
    }
+}
 
-   Ayee.SetSize(C.Width(), C.Width());
-   Ayee = CtMC;
-   for (int i = 0; i < Ayee.Height(); i++)
+void YeeOperatorBuilder::AssembleYeeMassOperator(
+   const std::function<double(const mfem::Vector &)> &eps_fn,
+   mfem::DenseMatrix &K2Meps,
+   double k0) const
+{
+   mfem::DenseMatrix Meps;
+   AssembleEdgeMassEps(eps_fn, Meps, k0);
+   K2Meps = Meps;
+   K2Meps *= (k0 * k0);
+}
+
+void YeeOperatorBuilder::AssembleYeeMaxwellOperatorComplex(
+   const std::function<double(const mfem::Vector &)> &eps_fn,
+   double k0,
+   mfem::DenseMatrix &Areal,
+   mfem::DenseMatrix &Aimag) const
+{
+   mfem::DenseMatrix Cr, Ci, MmuInv, Meps;
+   BuildCurlIncidenceComplex(k0, Cr, Ci);
+   AssembleFaceMassMuInv(MmuInv, 0.0);
+   AssembleEdgeMassEps(eps_fn, Meps, 0.0);
+
+   const int ne = Cr.Width();
+   Areal.SetSize(ne, ne);
+   Aimag.SetSize(ne, ne);
+   Areal = 0.0;
+   Aimag = 0.0;
+
+   for (int f = 0; f < Cr.Height(); f++)
    {
-      for (int j = 0; j < Ayee.Width(); j++)
+      const double w = MmuInv(f, f);
+      if (std::abs(w) == 0.0) { continue; }
+      for (int i = 0; i < ne; i++)
       {
-         Ayee(i, j) -= k0 * k0 * Meps(i, j);
+         const std::complex<double> cfi(Cr(f, i), Ci(f, i));
+         if (std::abs(cfi) == 0.0) { continue; }
+         for (int j = 0; j < ne; j++)
+         {
+            const std::complex<double> cfj(Cr(f, j), Ci(f, j));
+            if (std::abs(cfj) == 0.0) { continue; }
+            const std::complex<double> val = w * cfi * cfj;
+            Areal(i, j) += val.real();
+            Aimag(i, j) += val.imag();
+         }
       }
+   }
+
+   for (int i = 0; i < ne; i++)
+   {
+      Areal(i, i) -= k0 * k0 * Meps(i, i);
    }
 }
 
@@ -493,8 +773,8 @@ void YeeOperatorBuilder::PrintDiagnostics(
    mfem::DenseMatrix C, MmuInv, Meps, Ayee;
    mfem::DenseMatrix CtMC;
    BuildCurlIncidence(C);
-   AssembleFaceMassMuInv(MmuInv);
-   AssembleEdgeMassEps(eps_fn, Meps);
+   AssembleFaceMassMuInv(MmuInv, k0);
+   AssembleEdgeMassEps(eps_fn, Meps, k0);
    CtMC.SetSize(C.Width(), C.Width());
    CtMC = 0.0;
    for (int f = 0; f < C.Height(); f++)

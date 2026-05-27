@@ -13,11 +13,15 @@ This repository contains two complementary prototypes:
 | Reference-space FDFD initial guess | `fdfd_iga_init/` | Geometry-aware finite-difference solve on the parameter domain, projected into the IGA `H(curl)` space as a GMRES initial guess. |
 | Covariant auxiliary-space preconditioner | `covariant_aux_space/` | Matrix-based two-level preconditioner `P⁻¹ ≈ Π A_aux⁻¹ Πᵀ` with explicit prolongation/restriction between a structured auxiliary grid and the IGA true-DOF space. |
 
-Three auxiliary prototype modes are supported:
+Three auxiliary prototype modes are implemented:
 
 - `nodal_proto`
 - `edge_galerkin_proto`
 - `edge_yee_proto` — Yee-edge auxiliary space with fast element-driven prolongation assembly
+
+The paper-facing benchmark path should use `edge_yee_proto` as the proposed
+method. `nodal_proto` and `edge_galerkin_proto` are internal ablation/validation
+modes, not main baselines.
 
 ## Dependencies
 
@@ -71,14 +75,20 @@ Expected output:
 Covariant-aux-preconditioned GMRES iterations: 36, converged=1
 ```
 
-### Reference initial guess only
+### Core paper benchmark table
 
 ```bash
-./fdfd_iga_init_demo \
-  --proto-mode none \
-  --mesh /mnt/f/optemcode/mfem/data/cube-nurbs.mesh \
-  -r 1
+./run_core_paper_cases.sh
 ```
+
+This writes:
+
+- `covariant_aux_space/core_paper_cases.csv`
+- `covariant_aux_space/core_paper_cases.md`
+- per-case logs in `covariant_aux_space/core_paper_case_logs/`
+
+The formal comparison table is `zero`, `FDFD init`, CPU Hypre AMS, and
+`edge_yee_proto`.
 
 ## Key options
 
@@ -115,6 +125,9 @@ opt_em_iga/
   run_proto_benchmark_matrix.sh   # Benchmark script
   run_hp_proto_scan.sh            # HP parameter scan
   run_hp_proto_scan_safe.sh       # HP scan with per-case timeout & logging
+  run_core_paper_cases.sh         # Four core paper cases and Markdown summary
+  tools/summarize_hp_scan.py      # CSV-to-Markdown summary helper
+  cuda_iterative_solver/          # Isolated CUDA Krylov solver sandbox
 ```
 
 ## Performance note

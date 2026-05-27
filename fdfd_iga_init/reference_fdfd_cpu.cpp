@@ -1,5 +1,6 @@
 #include "reference_fdfd_cpu.hpp"
 #include <algorithm>
+#include <cmath>
 
 namespace fdfd_iga_init
 {
@@ -29,7 +30,66 @@ inline void SetComp(std::vector<double> &v, int nnode, int c, int id, double val
    v[c * nnode + id] = val;
 }
 
+// Precomputed spacing for fast access
+struct SpacingData
+{
+   bool is_uniform;
+   double hx, hy, hz;                          // uniform spacing (if uniform)
+   std::vector<double> cx, cy, cz;             // cell widths [nx-1], [ny-1], [nz-1]
+   std::vector<double> px, py, pz;             // node positions [nx], [ny], [nz]
+};
+
+SpacingData MakeSpacing(const ReferenceGrid &grid)
+{
+   SpacingData s;
+   const int nx = grid.nx, ny = grid.ny, nz = grid.nz;
+   s.is_uniform = IsUniformGrid(grid);
+
+   if (s.is_uniform && grid.knot_x.empty())
+   {
+      s.hx = 1.0 / double(nx - 1);
+      s.hy = 1.0 / double(ny - 1);
+      s.hz = 1.0 / double(nz - 1);
+      return s;
+   }
+
+   // Populate node positions
+   s.px = grid.knot_x;
+   s.py = grid.knot_y;
+   s.pz = grid.knot_z;
+
+   // Cell widths
+   s.cx.resize(nx - 1);
+   for (int i = 0; i < nx - 1; i++) s.cx[i] = s.px[i+1] - s.px[i];
+   s.cy.resize(ny - 1);
+   for (int i = 0; i < ny - 1; i++) s.cy[i] = s.py[i+1] - s.py[i];
+   s.cz.resize(nz - 1);
+   for (int i = 0; i < nz - 1; i++) s.cz[i] = s.pz[i+1] - s.pz[i];
+
+   // For is_uniform with stored knots
+   if (s.is_uniform)
+   {
+      s.hx = s.cx[0];
+      s.hy = (ny > 2) ? s.cy[0] : 1.0;
+      s.hz = (nz > 2) ? s.cz[0] : 1.0;
+   }
+   return s;
+}
+
 } // namespace
+
+ReferenceFDFDCPU::GridSpacing ReferenceFDFDCPU::ComputeSpacing() const
+{
+   auto s = MakeSpacing(grid_);
+   GridSpacing gs;
+   gs.cell_width_x = std::move(s.cx);
+   gs.cell_width_y = std::move(s.cy);
+   gs.cell_width_z = std::move(s.cz);
+   gs.node_pos_x = std::move(s.px);
+   gs.node_pos_y = std::move(s.py);
+   gs.node_pos_z = std::move(s.pz);
+   return gs;
+}
 
 ReferenceFDFDCPU::ReferenceFDFDCPU(const SinglePatchNURBSEvaluator &geom)
    : geom_(geom)
@@ -40,20 +100,24 @@ void ReferenceFDFDCPU::SampleMetric(
    const std::function<double(const mfem::Vector &)> &eps_fn,
    std::vector<MetricSample> &metric) const
 {
-   const int n = grid_.nx * grid_.ny * grid_.nz;
+   const int nx = grid_.nx, ny = grid_.ny, nz = grid_.nz;
+   const int n = nx * ny * nz;
    metric.resize(n);
    mfem::Vector xi(3), x_phys;
    mfem::DenseMatrix J, invJ, JTJ, invJJT;
    const int dim = geom_.Dimension();
-   for (int k = 0; k < grid_.nz; k++)
+
+   auto s = MakeSpacing(grid_);
+
+   for (int k = 0; k < nz; k++)
    {
-      xi[2] = (grid_.nz == 1) ? 0.0 : double(k) / double(grid_.nz - 1);
-      for (int j = 0; j < grid_.ny; j++)
+      xi[2] = s.is_uniform ? double(k) / double(nz - 1) : s.pz[k];
+      for (int j = 0; j < ny; j++)
       {
-         xi[1] = (grid_.ny == 1) ? 0.0 : double(j) / double(grid_.ny - 1);
-         for (int i = 0; i < grid_.nx; i++)
+         xi[1] = s.is_uniform ? double(j) / double(ny - 1) : s.py[j];
+         for (int i = 0; i < nx; i++)
          {
-            xi[0] = (grid_.nx == 1) ? 0.0 : double(i) / double(grid_.nx - 1);
+            xi[0] = s.is_uniform ? double(i) / double(nx - 1) : s.px[i];
             geom_.EvalGeometry(xi, x_phys, J);
 
             const double detJ = J.Det();
@@ -87,18 +151,21 @@ void ReferenceFDFDCPU::SampleSource(
    const std::function<void(const mfem::Vector &, mfem::Vector &)> &src_fn,
    std::vector<double> &rhs) const
 {
-   const int nnode = grid_.nx * grid_.ny * grid_.nz;
+   const int nx = grid_.nx, ny = grid_.ny, nz = grid_.nz;
+   const int nnode = nx * ny * nz;
    rhs.assign(3 * nnode, 0.0);
    mfem::Vector xi(3), val(3);
-   for (int k = 0; k < grid_.nz; k++)
+   auto s = MakeSpacing(grid_);
+
+   for (int k = 0; k < nz; k++)
    {
-      xi[2] = (grid_.nz == 1) ? 0.0 : double(k) / double(grid_.nz - 1);
-      for (int j = 0; j < grid_.ny; j++)
+      xi[2] = s.is_uniform ? double(k) / double(nz - 1) : s.pz[k];
+      for (int j = 0; j < ny; j++)
       {
-         xi[1] = (grid_.ny == 1) ? 0.0 : double(j) / double(grid_.ny - 1);
-         for (int i = 0; i < grid_.nx; i++)
+         xi[1] = s.is_uniform ? double(j) / double(ny - 1) : s.py[j];
+         for (int i = 0; i < nx; i++)
          {
-            xi[0] = (grid_.nx == 1) ? 0.0 : double(i) / double(grid_.nx - 1);
+            xi[0] = s.is_uniform ? double(i) / double(nx - 1) : s.px[i];
             val.SetSize(3);
             val = 0.0;
             src_fn(xi, val);
@@ -117,34 +184,46 @@ void ReferenceFDFDCPU::ApplyCurlCurlMinusMass(
    const std::vector<double> &x,
    std::vector<double> &y) const
 {
-   const int nnode = grid_.nx * grid_.ny * grid_.nz;
-   const double hx = 1.0 / double(grid_.nx - 1);
-   const double hy = 1.0 / double(grid_.ny - 1);
-   const double hz = 1.0 / double(grid_.nz - 1);
+   const int nx = grid_.nx, ny = grid_.ny, nz = grid_.nz;
+   const int nnode = nx * ny * nz;
    y.assign(3 * nnode, 0.0);
 
+   auto s = MakeSpacing(grid_);
+
+   // Centered difference helpers. For uniform: denominator = 2*h.
+   // For non-uniform: denominator = x_{i+1} - x_{i-1}.
    auto diff_x = [&](int c, int i, int j, int k) -> double
    {
-      return (GetComp(x, nnode, c, NodeId(i + 1, j, k)) -
-              GetComp(x, nnode, c, NodeId(i - 1, j, k))) / (2.0 * hx);
+      const int id_p = NodeId(i + 1, j, k);
+      const int id_m = NodeId(i - 1, j, k);
+      double denom = s.is_uniform ? 2.0 * s.hx :
+                     (s.px[i+1] - s.px[i-1]);
+      return (GetComp(x, nnode, c, id_p) - GetComp(x, nnode, c, id_m)) / denom;
    };
    auto diff_y = [&](int c, int i, int j, int k) -> double
    {
-      return (GetComp(x, nnode, c, NodeId(i, j + 1, k)) -
-              GetComp(x, nnode, c, NodeId(i, j - 1, k))) / (2.0 * hy);
+      const int id_p = NodeId(i, j + 1, k);
+      const int id_m = NodeId(i, j - 1, k);
+      double denom = s.is_uniform ? 2.0 * s.hy :
+                     (s.py[j+1] - s.py[j-1]);
+      return (GetComp(x, nnode, c, id_p) - GetComp(x, nnode, c, id_m)) / denom;
    };
    auto diff_z = [&](int c, int i, int j, int k) -> double
    {
-      return (GetComp(x, nnode, c, NodeId(i, j, k + 1)) -
-              GetComp(x, nnode, c, NodeId(i, j, k - 1))) / (2.0 * hz);
+      const int id_p = NodeId(i, j, k + 1);
+      const int id_m = NodeId(i, j, k - 1);
+      double denom = s.is_uniform ? 2.0 * s.hz :
+                     (s.pz[k+1] - s.pz[k-1]);
+      return (GetComp(x, nnode, c, id_p) - GetComp(x, nnode, c, id_m)) / denom;
    };
 
+   // Step 1: compute curl E → flux
    std::vector<double> flux(3 * nnode, 0.0);
-   for (int k = 1; k < grid_.nz - 1; k++)
+   for (int k = 1; k < nz - 1; k++)
    {
-      for (int j = 1; j < grid_.ny - 1; j++)
+      for (int j = 1; j < ny - 1; j++)
       {
-         for (int i = 1; i < grid_.nx - 1; i++)
+         for (int i = 1; i < nx - 1; i++)
          {
             const int id = NodeId(i, j, k);
             const double curlE[3] = {
@@ -162,27 +241,37 @@ void ReferenceFDFDCPU::ApplyCurlCurlMinusMass(
       }
    }
 
+   // Step 2: compute curl of flux (same stencil)
    auto flux_dx = [&](int c, int i, int j, int k) -> double
    {
-      return (GetComp(flux, nnode, c, NodeId(i + 1, j, k)) -
-              GetComp(flux, nnode, c, NodeId(i - 1, j, k))) / (2.0 * hx);
+      const int id_p = NodeId(i + 1, j, k);
+      const int id_m = NodeId(i - 1, j, k);
+      double denom = s.is_uniform ? 2.0 * s.hx :
+                     (s.px[i+1] - s.px[i-1]);
+      return (GetComp(flux, nnode, c, id_p) - GetComp(flux, nnode, c, id_m)) / denom;
    };
    auto flux_dy = [&](int c, int i, int j, int k) -> double
    {
-      return (GetComp(flux, nnode, c, NodeId(i, j + 1, k)) -
-              GetComp(flux, nnode, c, NodeId(i, j - 1, k))) / (2.0 * hy);
+      const int id_p = NodeId(i, j + 1, k);
+      const int id_m = NodeId(i, j - 1, k);
+      double denom = s.is_uniform ? 2.0 * s.hy :
+                     (s.py[j+1] - s.py[j-1]);
+      return (GetComp(flux, nnode, c, id_p) - GetComp(flux, nnode, c, id_m)) / denom;
    };
    auto flux_dz = [&](int c, int i, int j, int k) -> double
    {
-      return (GetComp(flux, nnode, c, NodeId(i, j, k + 1)) -
-              GetComp(flux, nnode, c, NodeId(i, j, k - 1))) / (2.0 * hz);
+      const int id_p = NodeId(i, j, k + 1);
+      const int id_m = NodeId(i, j, k - 1);
+      double denom = s.is_uniform ? 2.0 * s.hz :
+                     (s.pz[k+1] - s.pz[k-1]);
+      return (GetComp(flux, nnode, c, id_p) - GetComp(flux, nnode, c, id_m)) / denom;
    };
 
-   for (int k = 1; k < grid_.nz - 1; k++)
+   for (int k = 1; k < nz - 1; k++)
    {
-      for (int j = 1; j < grid_.ny - 1; j++)
+      for (int j = 1; j < ny - 1; j++)
       {
-         for (int i = 1; i < grid_.nx - 1; i++)
+         for (int i = 1; i < nx - 1; i++)
          {
             const int id = NodeId(i, j, k);
             const double curlFlux[3] = {
@@ -210,26 +299,46 @@ void ReferenceFDFDCPU::BuildDiagonalPreconditioner(
    const std::vector<MetricSample> &metric,
    std::vector<double> &diag) const
 {
-   const int nnode = grid_.nx * grid_.ny * grid_.nz;
-   const double hx = 1.0 / double(grid_.nx - 1);
-   const double hy = 1.0 / double(grid_.ny - 1);
-   const double hz = 1.0 / double(grid_.nz - 1);
-   const double scale = 2.0 / (hx * hx) + 2.0 / (hy * hy) + 2.0 / (hz * hz);
+   const int nx = grid_.nx, ny = grid_.ny, nz = grid_.nz;
+   const int nnode = nx * ny * nz;
    diag.assign(3 * nnode, 1.0);
 
-   for (int k = 0; k < grid_.nz; k++)
+   auto s = MakeSpacing(grid_);
+
+   // Gershgorin-like diagonal scaling
+   for (int k = 0; k < nz; k++)
    {
-      for (int j = 0; j < grid_.ny; j++)
+      for (int j = 0; j < ny; j++)
       {
-         for (int i = 0; i < grid_.nx; i++)
+         for (int i = 0; i < nx; i++)
          {
             const int id = NodeId(i, j, k);
             if (i == 0 || j == 0 || k == 0 ||
-                i == grid_.nx - 1 || j == grid_.ny - 1 || k == grid_.nz - 1)
+                i == nx - 1 || j == ny - 1 || k == nz - 1)
             {
                diag[id] = diag[nnode + id] = diag[2 * nnode + id] = 1.0;
                continue;
             }
+
+            // Laplacian scaling: 1/h² per direction
+            double hx_inv2, hy_inv2, hz_inv2;
+            if (s.is_uniform)
+            {
+               hx_inv2 = 1.0 / (s.hx * s.hx);
+               hy_inv2 = 1.0 / (s.hy * s.hy);
+               hz_inv2 = 1.0 / (s.hz * s.hz);
+            }
+            else
+            {
+               // Average of left and right cell inverse squares
+               double dx_l = s.px[i] - s.px[i-1], dx_r = s.px[i+1] - s.px[i];
+               double dy_l = s.py[j] - s.py[j-1], dy_r = s.py[j+1] - s.py[j];
+               double dz_l = s.pz[k] - s.pz[k-1], dz_r = s.pz[k+1] - s.pz[k];
+               hx_inv2 = 0.5 * (1.0/(dx_l*dx_l) + 1.0/(dx_r*dx_r));
+               hy_inv2 = 0.5 * (1.0/(dy_l*dy_l) + 1.0/(dy_r*dy_r));
+               hz_inv2 = 0.5 * (1.0/(dz_l*dz_l) + 1.0/(dz_r*dz_r));
+            }
+            const double scale = 2.0 * (hx_inv2 + hy_inv2 + hz_inv2);
 
             const double curl_trace =
                metric[id].curl_metric[0] + metric[id].curl_metric[4] +
@@ -250,7 +359,8 @@ void ReferenceFDFDCPU::JacobiSolve(const std::vector<MetricSample> &metric,
                                    const std::vector<double> &rhs,
                                    std::vector<double> &x) const
 {
-   const int nnode = grid_.nx * grid_.ny * grid_.nz;
+   const int nx = grid_.nx, ny = grid_.ny, nz = grid_.nz;
+   const int nnode = nx * ny * nz;
    std::vector<double> diag, Ax, residual;
    BuildDiagonalPreconditioner(metric, diag);
    x.assign(3 * nnode, 0.0);
@@ -261,15 +371,15 @@ void ReferenceFDFDCPU::JacobiSolve(const std::vector<MetricSample> &metric,
       ApplyCurlCurlMinusMass(metric, x, Ax);
       for (int c = 0; c < 3; c++)
       {
-         for (int k = 0; k < grid_.nz; k++)
+         for (int k = 0; k < nz; k++)
          {
-            for (int j = 0; j < grid_.ny; j++)
+            for (int j = 0; j < ny; j++)
             {
-               for (int i = 0; i < grid_.nx; i++)
+               for (int i = 0; i < nx; i++)
                {
                   const int id = NodeId(i, j, k);
                   if (i == 0 || j == 0 || k == 0 ||
-                      i == grid_.nx - 1 || j == grid_.ny - 1 || k == grid_.nz - 1)
+                      i == nx - 1 || j == ny - 1 || k == nz - 1)
                   {
                      x[c * nnode + id] = 0.0;
                      continue;

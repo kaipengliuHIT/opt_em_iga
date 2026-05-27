@@ -109,16 +109,16 @@ Preferred direction:
 
 ### Gap 3: Missing baseline comparisons
 
-The paper should compare against:
+The main paper tables should compare against:
 
 - no preconditioner / zero initial guess
 - reference FDFD initial guess only
-- `nodal_proto`
-- `edge_galerkin_proto`
+- CPU Hypre AMS
 - `edge_yee_proto`
-- Jacobi or diagonal preconditioner
-- Hypre AMS if feasible
-- ILU/block Jacobi if feasible
+
+`nodal_proto`, `edge_galerkin_proto`, Jacobi, and ILU/block Jacobi are useful as
+internal diagnostics or optional appendix ablations, but they should not be the
+main paper story unless a reviewer asks for more solver context.
 
 ### Gap 4: Theory and formulation need packaging
 
@@ -171,7 +171,7 @@ Goal: show that `edge_yee_proto` reduces GMRES iterations and solve time.
 
 Suggested table columns:
 
-| mesh | eps mode | order | refine | aux_n | true DOFs | aux DOFs | zero iters | FDFD iters | nodal iters | edge_galerkin iters | edge_yee iters | setup time | solve time |
+| mesh | eps mode | order | refine | aux_n | true DOFs | aux DOFs | zero iters | FDFD iters | AMS iters | edge_yee iters | setup time | solve time |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 
 Suggested parameter ranges:
@@ -505,7 +505,7 @@ A realistic minimum SCI package should include:
   - two polynomial orders
   - two material profiles
   - several auxiliary grid sizes
-- Comparison against at least zero/FDFD/nodal/edge-galerkin baselines.
+- Comparison against at least zero, FDFD initial guess, and CPU Hypre AMS.
 - Honest discussion of auxiliary solver scalability.
 
 ## 10. Immediate next actions
@@ -518,7 +518,7 @@ A realistic minimum SCI package should include:
 
 ```text
 mesh = cube-nurbs, warped-cube-singlepatch-nurbs
-proto = nodal_proto, edge_galerkin_proto, edge_yee_proto
+proto = edge_yee_proto
 order = 2, 3
 refine = 1, 2, 3
 epsilon_mode = constant, layered_x

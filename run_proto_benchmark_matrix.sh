@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="/mnt/d/code/code_opt_em/opt_em_iga"
+WORKSPACE="${WORKSPACE:-/mnt/f/optemcode}"
+ROOT="${ROOT:-$WORKSPACE/opt_em_iga_repo}"
 BIN="$ROOT/fdfd_iga_init_demo"
 
 MESHES=(
-  "/mnt/d/code/code_opt_em/mfem/data/cube-nurbs.mesh"
+  "$WORKSPACE/mfem/data/cube-nurbs.mesh"
   "$ROOT/meshes/warped-cube-singlepatch-nurbs.mesh"
 )
 
@@ -31,7 +32,7 @@ for mesh in "${MESHES[@]}"; do
     for proto in "${PROTOS[@]}"; do
       echo
       echo "=== mesh=$mesh proto=$proto epsilon_mode=$eps_mode ==="
-      LD_LIBRARY_PATH=/mnt/d/code/code_opt_em/opt/openmpi/lib:/mnt/d/code/code_opt_em/opt/hypre/lib:${LD_LIBRARY_PATH:-} \
+      LD_LIBRARY_PATH="$WORKSPACE/opt/openmpi/lib:$WORKSPACE/opt/hypre/lib:${LD_LIBRARY_PATH:-}" \
         "$BIN" \
         --proto-mode "$proto" \
         --mesh "$mesh" \

@@ -3,6 +3,7 @@
 #include "reference_initial_guess.hpp"
 #include "../covariant_aux_space/covariant_reference_preconditioner.hpp"
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -126,6 +127,43 @@ struct SolveStats
    bool converged = false;
 };
 
+class RealBlockPreconditioner : public Solver
+{
+public:
+   RealBlockPreconditioner(Solver &real_prec, int block_size)
+      : Solver(2 * block_size, 2 * block_size),
+        real_prec_(real_prec),
+        block_size_(block_size) {}
+
+   void SetOperator(const Operator &) override {}
+
+   void Mult(const Vector &x, Vector &y) const override
+   {
+      y.SetSize(2 * block_size_);
+      xr_.SetSize(block_size_);
+      yr_.SetSize(block_size_);
+
+      for (int offset = 0; offset <= block_size_; offset += block_size_)
+      {
+         for (int i = 0; i < block_size_; i++)
+         {
+            xr_[i] = x[offset + i];
+         }
+         real_prec_.Mult(xr_, yr_);
+         for (int i = 0; i < block_size_; i++)
+         {
+            y[offset + i] = yr_[i];
+         }
+      }
+   }
+
+private:
+   Solver &real_prec_;
+   int block_size_ = 0;
+   mutable Vector xr_;
+   mutable Vector yr_;
+};
+
 struct CaseConfig
 {
    int order = 2;
@@ -136,11 +174,14 @@ struct CaseConfig
    double eps_r = 8.0;
    bool save_output = false;
    int gmres_print = 1;
+   int gmres_max_iter = 800;
    std::string proto_mode = "nodal_proto";
    std::string source_mode = "gaussian_y";
    std::string epsilon_mode = "constant";
    bool diagnose_coarse = false;
    bool calibrate_yee_diag = false;
+   bool knot_align = false;
+   int  cells_per_span = 0;
 };
 
 covariant_aux_space::CovariantReferencePreconditioner::PrototypeMode
@@ -170,6 +211,7 @@ SolveStats RunGmresSolve(ParSesquilinearForm &a,
                          ParComplexLinearForm &b,
                          ParComplexGridFunction &x,
                          int print_level,
+                         int max_iter,
                          const char *label = nullptr,
                          bool scale_initial_guess = false,
                          mfem::Solver *precond = nullptr)
@@ -207,7 +249,7 @@ SolveStats RunGmresSolve(ParSesquilinearForm &a,
    }
    gmres.SetPrintLevel(0);
    gmres.SetKDim(100);
-   gmres.SetMaxIter(800);
+   gmres.SetMaxIter(max_iter);
    gmres.SetRelTol(1e-8);
    gmres.SetAbsTol(0.0);
    gmres.Mult(B, X);
@@ -263,6 +305,10 @@ int AuxiliaryDofsForGrid(int aux_n)
 
 int AuxiliaryDofsForGrid(int aux_n, const std::string &proto_mode)
 {
+   if (proto_mode == "ams")
+   {
+      return 0;
+   }
    if (proto_mode == "nodal_proto")
    {
       return 3 * std::max(0, aux_n - 2) * std::max(0, aux_n - 2) * std::max(0, aux_n - 2);
@@ -374,23 +420,32 @@ CaseResult RunCase(const char *mesh_file, const CaseConfig &cfg)
    ReferenceFieldProjector projector(fespace, ref_field);
    projector.Project(x_fdfd);
 
-   covariant_aux_space::CovariantReferencePreconditioner aux_prec(fespace, geom, eps_fn);
-   aux_prec.SetPrototypeMode(ParsePrototypeMode(cfg.proto_mode));
-   aux_prec.SetYeeDiagonalCalibration(cfg.calibrate_yee_diag);
-   aux_prec.SetGrid({cfg.aux_n, cfg.aux_n, cfg.aux_n});
-   aux_prec.SetWaveNumber(k0);
-   aux_prec.SetMaxIterations(300);
-   aux_prec.SetDamping(0.7);
-   aux_prec.SetMassShift(0.1);
-   if (cfg.diagnose_coarse && cfg.proto_mode != "nodal_proto")
+   std::unique_ptr<covariant_aux_space::CovariantReferencePreconditioner> aux_prec;
+   if (cfg.proto_mode != "ams")
+   {
+      aux_prec = std::make_unique<covariant_aux_space::CovariantReferencePreconditioner>(
+         fespace, geom, eps_fn);
+      aux_prec->SetPrototypeMode(ParsePrototypeMode(cfg.proto_mode));
+      aux_prec->SetYeeDiagonalCalibration(cfg.calibrate_yee_diag);
+      if (cfg.knot_align && cfg.cells_per_span > 0)
+      {
+         aux_prec->SetKnotAlignGrid(true, cfg.cells_per_span);
+      }
+      aux_prec->SetGrid({cfg.aux_n, cfg.aux_n, cfg.aux_n});
+      aux_prec->SetWaveNumber(k0);
+      aux_prec->SetMaxIterations(300);
+      aux_prec->SetDamping(0.7);
+      aux_prec->SetMassShift(0.1);
+   }
+   if (cfg.diagnose_coarse && cfg.proto_mode != "nodal_proto" && cfg.proto_mode != "ams")
    {
       OperatorPtr Adiag;
       Vector Xdiag, Bdiag;
       a.FormLinearSystem(ess_tdofs, x_prec, b, Adiag, Xdiag, Bdiag);
-      aux_prec.SetOperator(*Adiag);
+      aux_prec->SetOperator(*Adiag);
       if (Mpi::WorldRank() == 0)
       {
-         aux_prec.PrintCoarseOperatorDiagnostics(std::cout);
+         aux_prec->PrintCoarseOperatorDiagnostics(std::cout);
       }
    }
 
@@ -399,11 +454,38 @@ CaseResult RunCase(const char *mesh_file, const CaseConfig &cfg)
    result.true_vsize = fespace.GetTrueVSize();
    result.aux_dofs = AuxiliaryDofsForGrid(cfg.aux_n, cfg.proto_mode);
    result.zero = RunGmresSolve(a, ess_tdofs, b, x_zero, cfg.gmres_print,
-                               "zero_init");
+                               cfg.gmres_max_iter, "zero_init");
    result.fdfd = RunGmresSolve(a, ess_tdofs, b, x_fdfd, cfg.gmres_print,
-                               "fdfd_init", true);
-   result.precond = RunGmresSolve(a, ess_tdofs, b, x_prec, cfg.gmres_print,
-                                  "aux_prec", false, &aux_prec);
+                               cfg.gmres_max_iter, "fdfd_init", true);
+   if (cfg.proto_mode == "ams")
+   {
+      // Use pos-def approximation (curl-curl + k0^2*eps) for AMS,
+      // following the ex25p/nurbs_ex25p pattern.
+      FunctionCoefficient pos_absomeg([k0, &eps_eval](const Vector &x) {
+         return k0 * k0 * eps_eval(x);
+      });
+      ParBilinearForm prec_ams(&fespace);
+      prec_ams.AddDomainIntegrator(new CurlCurlIntegrator(muinv));
+      prec_ams.AddDomainIntegrator(new VectorFEMassIntegrator(pos_absomeg));
+      prec_ams.Assemble();
+      prec_ams.Finalize();
+      OperatorHandle Ah;
+      prec_ams.FormSystemMatrix(ess_tdofs, Ah);
+      HypreParMatrix *A_hypre = Ah.As<HypreParMatrix>();
+      MFEM_VERIFY(A_hypre, "AMS baseline requires a HypreParMatrix system.");
+      HypreAMS ams(*A_hypre, &fespace);
+      ams.SetPrintLevel(0);
+      RealBlockPreconditioner ams_block(ams, fespace.GetTrueVSize());
+      result.precond = RunGmresSolve(a, ess_tdofs, b, x_prec, cfg.gmres_print,
+                                     cfg.gmres_max_iter, "aux_prec", false,
+                                     &ams_block);
+   }
+   else
+   {
+      result.precond = RunGmresSolve(a, ess_tdofs, b, x_prec, cfg.gmres_print,
+                                     cfg.gmres_max_iter, "aux_prec", false,
+                                     aux_prec.get());
+   }
 
    if (cfg.save_output)
    {
@@ -440,6 +522,7 @@ void PrintCaseHeader(const CaseConfig &cfg, const CaseResult &result)
              << ", epsilon_mode=" << cfg.epsilon_mode
              << ", aux_dofs=" << result.aux_dofs
              << ", aux_ratio=" << double(result.aux_dofs) / double(result.true_vsize)
+             << ", gmres_max_iter=" << cfg.gmres_max_iter
              << ", wavelength=" << cfg.wavelength
              << ", eps_r=" << cfg.eps_r << std::endl;
 }
@@ -453,7 +536,7 @@ void PrintCaseSummary(const CaseResult &result)
              << "FDFD-initialized GMRES iterations: "
              << result.fdfd.iters
              << ", converged=" << result.fdfd.converged << '\n'
-             << "Covariant-aux-preconditioned GMRES iterations: "
+             << "Preconditioned GMRES iterations: "
              << result.precond.iters
              << ", converged=" << result.precond.converged << std::endl;
 }
@@ -588,8 +671,10 @@ int main(int argc, char *argv[])
                   "Enable ParaView output.");
    args.AddOption(&cfg.wavelength, "-wl", "--wavelength", "Wavelength.");
    args.AddOption(&cfg.eps_r, "-eps", "--epsilon", "Relative permittivity.");
+   args.AddOption(&cfg.gmres_max_iter, "-gmi", "--gmres-max-iter",
+                  "Maximum GMRES iterations for each solve.");
    args.AddOption(&cfg.proto_mode, "-pm", "--proto-mode",
-                  "Auxiliary prototype mode: nodal_proto, edge_galerkin_proto, or edge_yee_proto.");
+                  "Auxiliary prototype mode: nodal_proto, edge_galerkin_proto, edge_yee_proto, or ams.");
    args.AddOption(&cfg.source_mode, "-sm", "--source-mode",
                   "Source mode: gaussian_y, gaussian_x, dipole_y, or trig_mix.");
    args.AddOption(&cfg.epsilon_mode, "-em", "--epsilon-mode",
@@ -600,6 +685,11 @@ int main(int argc, char *argv[])
    args.AddOption(&cfg.calibrate_yee_diag, "-cyd", "--calibrate-yee-diag",
                   "-no-cyd", "--no-calibrate-yee-diag",
                   "Scale edge_yee_proto coarse operator by matching diagonal mean to the Galerkin coarse operator.");
+   args.AddOption(&cfg.knot_align, "-ka", "--knot-align",
+                  "-no-ka", "--no-knot-align",
+                  "Align Yee grid lines to NURBS knot positions.");
+   args.AddOption(&cfg.cells_per_span, "-cps", "--cells-per-span",
+                  "Cells per knot span (0=use -an directly).");
    args.AddOption(&scan, "-scan", "--scan", "-no-scan", "--no-scan",
                   "Run a parameter sweep instead of a single case.");
    args.AddOption(&scan_orders, "-scan-orders", "--scan-orders",

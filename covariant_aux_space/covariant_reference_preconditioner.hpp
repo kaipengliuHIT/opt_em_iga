@@ -39,7 +39,29 @@ public:
    void SetPrototypeMode(PrototypeMode mode);
    PrototypeMode GetPrototypeMode() const { return mode_; }
    void SetYeeDiagonalCalibration(bool enable) { yee_diag_calibration_ = enable; }
+   void SetYeeReferencePML(bool enabled, double thickness = 0.25,
+                           double strength = 5.0, double order = 2.0);
+   void SetYeePMLGalerkinFallback(bool enable)
+   { yee_pml_galerkin_fallback_ = enable; MarkDirty(); }
+   void SetIdentitySmootherWeight(double weight)
+   { identity_smoother_weight_ = weight; }
+   void SetOperatorJacobiSmootherWeight(double weight)
+   { operator_jacobi_smoother_weight_ = weight; }
+   void SetOperatorJacobiSmootherIterations(int iterations)
+   { operator_jacobi_smoother_iterations_ = std::max(1, iterations); }
+   const fdfd_iga_init::ReferenceGrid &GetYeeGrid() const
+   { return yee_operator_->Grid(); }
+   void SetKnotAlignGrid(bool enable, int cells_per_span = 1);
    void PrintCoarseOperatorDiagnostics(std::ostream &os) const;
+   void PrintYeeGalerkinComparison(std::ostream &os) const;
+   void PrintYeeGalerkinComparison(const mfem::Operator &ref_op,
+                                   const char *ref_name,
+                                   std::ostream &os) const;
+   void PrintYeeCandidateComparison(const mfem::Operator &ref_op,
+                                    const mfem::DenseMatrix &Acand,
+                                    const char *ref_name,
+                                    const char *cand_name,
+                                    std::ostream &os) const;
 
 private:
    using AuxDof = YeeEdgeDof;
@@ -51,6 +73,9 @@ private:
    PrototypeMode mode_ = PrototypeMode::nodal_proto;
    double k0_ = 1.0;
    bool yee_diag_calibration_ = false;
+   bool knot_align_enabled_ = false;
+   int knot_align_cps_ = 1;
+   mutable bool knot_align_applied_ = false;
    mutable fdfd_iga_init::ReferenceFDFDCPU aux_solver_;
    mutable std::unique_ptr<YeeTransferBuilder> yee_transfer_;
    mutable std::unique_ptr<YeeOperatorBuilder> yee_operator_;
@@ -58,20 +83,39 @@ private:
    mutable std::vector<AuxDof> aux_dofs_;
    mutable mfem::DenseMatrix Pi_;
    mutable mfem::DenseMatrix Aaux_;
+   mutable mfem::DenseMatrix AauxImag_;
+   mutable mfem::DenseMatrix AauxBlock_;
    mutable std::unique_ptr<mfem::DenseMatrixInverse> AauxInv_;
+   mutable std::unique_ptr<mfem::DenseMatrixInverse> AauxBlockInv_;
    mutable mfem::Vector r_re_;
    mutable mfem::Vector r_im_;
    mutable mfem::Vector z_re_;
    mutable mfem::Vector z_im_;
    mutable mfem::Vector aux_rhs_;
    mutable mfem::Vector aux_sol_;
+   mutable mfem::Vector aux_rhs_block_;
+   mutable mfem::Vector aux_sol_block_;
+   mutable mfem::Vector op_jacobi_inv_diag_;
+   mutable mfem::Vector op_jacobi_work_;
+   mutable mfem::Vector op_jacobi_res_;
+   mutable mfem::Vector op_jacobi_Awork_;
+   bool yee_complex_auxiliary_ = false;
+   bool yee_pml_galerkin_fallback_ = true;
+   double identity_smoother_weight_ = 0.0;
+   double operator_jacobi_smoother_weight_ = 0.0;
+   int operator_jacobi_smoother_iterations_ = 1;
 
    void MarkDirty();
    void BuildAuxiliaryOperators() const;
+   void BuildOperatorJacobiSmoother() const;
+   void AddOperatorJacobiSmoother(const mfem::Vector &r,
+                                  mfem::Vector &z) const;
    void BuildAuxDofs() const;
    void BuildTransferMatrix() const;
    void BuildAuxiliaryMatrix() const;
    void BuildGalerkinEdgeCoarseMatrix(mfem::DenseMatrix &Agal) const;
+   void BuildGalerkinEdgeCoarseMatrix(const mfem::Operator &ref_op,
+                                      mfem::DenseMatrix &Agal) const;
    int FullVectorIndex(const AuxDof &dof) const;
    double EdgeLength(const AuxDof &dof) const;
    fdfd_iga_init::SampledReferenceField MakeAuxBasisField(const AuxDof &dof) const;

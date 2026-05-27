@@ -17,11 +17,20 @@ adjoint_test_poisson
 focusing_2d
 fdfd_iga_init_demo
 fdfd_iga_init_demo_debug
+minimal_demo
+pml_point_source_demo
+
+# Temporary/backup source snapshots
+*.bak
+*.bak*
+*corrupted*
 
 # Generated visualization/data
 ParaView/
 fdfd_iga_init_zero/
 fdfd_iga_init_fdfd/
+refined.mesh.*
+sol_*.gf.*
 *.gf
 *.vtk
 *.png
