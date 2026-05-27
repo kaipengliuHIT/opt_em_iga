@@ -6,6 +6,52 @@
 
 ---
 
+## 0. 2026-05-27 修正：PML 路线的新状态
+
+上一阶段把 PML 情况下的 `edge_yee` 自动 fallback 到
+
+```text
+A_aux = Pi^T A_h Pi
+```
+
+作为主要可行路线。最新实验把这件事进一步拆开了：
+
+1. `edge_galerkin` / PML fallback 仍然是重要的上界和诊断工具。
+   它使用 Yee edge auxiliary space 和 transfer `Pi`，但 coarse operator 是
+   `Pi^T A_h Pi`，不是独立 FDFD/Yee operator。
+
+2. 真正 cheap 的 PML 研究对象应写成
+
+```text
+M^{-1} r = S^{-1} r + Pi A_yee,PML^{-1} Pi^T r
+```
+
+其中 `A_yee,PML` 是独立 Yee-PML coarse operator，`S^{-1}` 是 full-rank
+smoother。只用低秩 coarse correction 会让 MFEM 的预条件残差看似收敛，
+但 true residual 仍然很大。
+
+3. 当前最有希望的 smoother 是一阶 operator-Jacobi：
+
+```text
+S^{-1} r = omega diag(A_h)^{-1} r
+```
+
+在 `cube-nurbs.mesh, order=2, refine=2, freq=4.0, knot-align cps=1` 上，
+用户已测到 `omega=2.5` 和 `omega=3.0` 可以把 true residual 压到
+`1e-5` 附近或以下；多步 Jacobi (`-sjit > 1`) 反而不稳定。
+
+4. 因此论文叙事应从“PML 必须 fallback”改成：
+
+```text
+Yee auxiliary-space coarse correction plus a full-rank smoother.
+```
+
+`edge_galerkin` 是 Yee auxiliary space 的一致 Galerkin reference；
+`edge_yee` 是把 `Pi^T A_h Pi` 替换成独立 Yee/FDFD coarse operator 后的
+廉价版本。
+
+---
+
 ## 1. 当前架构
 
 ```
