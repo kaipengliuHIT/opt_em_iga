@@ -1,27 +1,143 @@
 # opt_em_iga
 
-Optimization of electromagnetic IGA simulations — fast auxiliary-space
-preconditioning and reference-space initial guesses for single-patch NURBS
-`H(curl)` Maxwell problems in [MFEM](https://mfem.org).
+Adaptive preconditioning and fast solvers for isogeometric analysis (IGA)
+of `H(curl)` Maxwell problems in [MFEM](https://mfem.org).
+
+Supports **real SPD** (cavity resonance) and **complex PML** (open-domain
+radiation) systems on single-patch NURBS geometries.
 
 ## Overview
 
-This repository contains two complementary prototypes:
+This repository develops a **diagnostic-driven adaptive preconditioning
+framework** for IGA Maxwell equations. Instead of searching for one universal
+preconditioner, we probe the system at runtime and automatically select the best
+preconditioner for the problem at hand.
 
-| Component | Directory | Purpose |
+### Project components
+
+| Component | Directory / File | System |
 |---|---|---|
-| Reference-space FDFD initial guess | `fdfd_iga_init/` | Geometry-aware finite-difference solve on the parameter domain, projected into the IGA `H(curl)` space as a GMRES initial guess. |
-| Covariant auxiliary-space preconditioner | `covariant_aux_space/` | Matrix-based two-level preconditioner `P⁻¹ ≈ Π A_aux⁻¹ Πᵀ` with explicit prolongation/restriction between a structured auxiliary grid and the IGA true-DOF space. |
+| **Adaptive preconditioner selector** | `prec_selector.cpp` | SPD + PML |
+| IGA AMS (Auxiliary-space Maxwell Solver) preconditioners | `iga_ams_preconditioner/` | SPD |
+| PML Pi-lumped auxiliary preconditioner tests | `pml_pi_prec_test.cpp` | PML |
+| PML p-multigrid bridge prototype | `pml_split_preconditioner/` | PML |
+| PML point-source demo | `pml_point_source_demo.cpp` | PML |
+| Covariant Yee auxiliary-space preconditioner | `covariant_aux_space/` | SPD |
+| Reference-space FDFD initial guess | `fdfd_iga_init/` | SPD |
+| Yee-to-IGA initial guess projection | `yee_init_guess/` | SPD |
+| IGA patch-RAS Schwarz preconditioner | `covariant_aux_space/iga_patch_ras_preconditioner.*` | SPD |
+| GPU BiCGStab iterative solver | `cuda_iterative_solver/` | SPD + PML |
 
-Three auxiliary prototype modes are implemented:
+## Key Scientific Findings
 
-- `nodal_proto`
-- `edge_galerkin_proto`
-- `edge_yee_proto` — Yee-edge auxiliary space with fast element-driven prolongation assembly
+### 1. Adaptive preconditioner selection is feasible
 
-The paper-facing benchmark path should use `edge_yee_proto` as the proposed
-method. `nodal_proto` and `edge_galerkin_proto` are internal ablation/validation
-modes, not main baselines.
+The `prec_selector` probes 4 candidate preconditioners (Jacobi, Pi_lumped+Jacobi,
+Jacobi→Pi multiplicative, Pi→Jacobi multiplicative) at 3 damping weights each
+(12 total) using two selector schemes:
+
+- **Scheme A (one-step residual probe)**: `ρ = |r₀ − A·B⁻¹·r₀| / |r₀|` — pick smallest ρ
+- **Scheme B (10-step warm-up probe)**: `score = log(|r₀|/|r₁₀|) / (t_setup + t_probe)` — pick highest score
+
+**Results across 5 test cases**:
+
+| Case | System | r | o | f | One-step selects | Warmup selects | Best iters | None iters |
+|------|--------|---|---|---|-----------------|----------------|------------|------------|
+| 1 | SPD | 2 | 2 | 5 | Pi→Jac ω=1.0 (27) | Jacobi ω=0.5 (71) | **27** | 80 |
+| 2 | SPD | 3 | 2 | 5 | Pi→Jac ω=1.0 (49) | Jacobi ω=0.7 (186) | **49** | 229 |
+| 3 | SPD | 2 | 3 | 5 | Pi→Jac ω=1.0 (46) | Jacobi ω=0.7 (139) | **46** | 159 |
+| 4 | SPD | 3 | 3 | 5 | Jac→Pi ω=1.0 (80) | Jacobi ω=1.0 (432) | **80** | 500 |
+| 5 | PML | 2 | 2 | 5 | Pi_lumped+Jac (1000✗) | Jacobi(cpx) ω=0.7 (176) | **176** | 574 |
+
+- **One-step probe**: reliable for SPD (correctly selects Pi-based methods),
+  unreliable for PML point-source (misled by Pi false-positive ρ < 1)
+- **Warmup probe**: reliable for PML, but overweights Pi setup cost for SPD
+
+### 2. Pi_lumped p-auxiliary preconditioner is effective for SPD, ineffective for PML
+
+- **SPD**: `Π_{p−1→p}` auxiliary space correction + Jacobi yields 1.9−3.3× speedup
+  - `Π_{p−1→p}` is the correct rule (NOT `Π_{1→p}`) for high-order IGA
+- **PML point-source**: Pi_lumped correction is ineffective (488−5000+ iters);
+  complex Jacobi alone is the best choice (176 iters, 3.26× vs none)
+
+### 3. Multiplicative composition beats additive
+
+Pi→Jacobi and Jacobi→Pi multiplicative forms consistently give 10−20% fewer
+iterations than the additive Pi_lumped+Jacobi form across all SPD cases.
+
+## Build
+
+```bash
+# Adaptive preconditioner selector (SPD + PML)
+make prec_selector
+
+# IGA AMS sweep
+make ams_sweep_v3
+
+# PML Pi preconditioner tests
+make pml_pi_prec_test
+
+# PML point-source demo
+make pml_point_source_demo
+
+# Covariant Yee auxiliary preconditioner
+make fdfd_iga_init_demo
+
+# Yee-to-IGA initial guess
+make yee_init_guess_demo
+
+# IGA patch-RAS Schwarz preconditioner
+make iga_ras_benchmark
+```
+
+To build without cuDSS:
+
+```bash
+make prec_selector LDFLAGS="$(make -p | grep LDFLAGS_NO_CUDSS | head -1 | cut -d= -f2-)"
+```
+
+## Quick Start
+
+### Environment
+
+```bash
+export LD_LIBRARY_PATH=/mnt/f/optemcode/opt/openmpi/lib:/mnt/f/optemcode/opt/hypre/lib:$LD_LIBRARY_PATH
+```
+
+### Adaptive preconditioner selector
+
+```bash
+# SPD cavity resonance (Cases 1-4)
+./prec_selector -system spd -r 2 -o 2 -f 5 -ao 1    # Case 1
+./prec_selector -system spd -r 3 -o 2 -f 5 -ao 1    # Case 2
+./prec_selector -system spd -r 2 -o 3 -f 5 -ao 2    # Case 3 (Π_{2→3})
+./prec_selector -system spd -r 3 -o 3 -f 5 -ao 2    # Case 4 (Π_{2→3})
+
+# PML open-domain radiation (Case 5)
+./prec_selector -system pml -r 2 -o 2 -f 5 -ao 1
+```
+
+### IGA AMS preconditioners
+
+```bash
+./ams_sweep_v3 -r 2 -o 2 -f 5    # SPD Pi_lumped sweep
+```
+
+### PML point-source demo
+
+```bash
+./pml_point_source_demo -m /mnt/f/optemcode/mfem/data/cube-nurbs.mesh -r 2 -o 2 -f 5
+```
+
+### Benchmark scripts
+
+```bash
+./run_core_paper_cases.sh              # Core paper cases (FDFD init + Yee aux)
+./run_full_preconditioner_benchmark.sh  # Full preconditioner benchmark matrix
+./run_sweep3.sh                         # SPD Pi_lumped HP sweep
+./run_pml_hp_sweep.sh                   # PML HP parameter sweep
+./run_iga_ras_benchmark.sh             # IGA patch-RAS Schwarz benchmark
+```
 
 ## Dependencies
 
@@ -31,7 +147,7 @@ modes, not main baselines.
 - **OpenMPI**
 - **CUDA 12** + **cuDSS** (optional, for GPU-accelerated coarse solves)
 
-The Makefile expects the following layout (override with `WORKSPACE_DIR`):
+The Makefile expects the following layout:
 
 ```
 /mnt/f/optemcode/
@@ -43,97 +159,59 @@ The Makefile expects the following layout (override with `WORKSPACE_DIR`):
     openmpi/
 ```
 
-## Build
-
-```bash
-make fdfd_iga_init_demo
-```
-
-To build without cuDSS:
-
-```bash
-make fdfd_iga_init_demo LDFLAGS="$(make -p | grep LDFLAGS_NO_CUDSS | head -1 | cut -d= -f2-)"
-```
-
-## Quick start
-
-### Auxiliary preconditioner (edge_yee_proto)
-
-```bash
-LD_LIBRARY_PATH=/mnt/f/optemcode/opt/openmpi/lib:/mnt/f/optemcode/opt/hypre/lib:$LD_LIBRARY_PATH \
-./fdfd_iga_init_demo \
-  --proto-mode edge_yee_proto \
-  --epsilon-mode constant \
-  --mesh /mnt/f/optemcode/mfem/data/cube-nurbs.mesh \
-  -r 2 -an 7
-```
-
-Expected output:
-
-```
-[yee_transfer] BuildProlongationFast done seconds=0.7~0.8
-Covariant-aux-preconditioned GMRES iterations: 36, converged=1
-```
-
-### Core paper benchmark table
-
-```bash
-./run_core_paper_cases.sh
-```
-
-This writes:
-
-- `covariant_aux_space/core_paper_cases.csv`
-- `covariant_aux_space/core_paper_cases.md`
-- per-case logs in `covariant_aux_space/core_paper_case_logs/`
-
-The formal comparison table is `zero`, `FDFD init`, CPU Hypre AMS, and
-`edge_yee_proto`.
-
-## Key options
+## Key Options (prec_selector)
 
 | Flag | Description |
 |---|---|
-| `--proto-mode` | Auxiliary prototype: `nodal_proto`, `edge_galerkin_proto`, `edge_yee_proto`, or `none` |
-| `--epsilon-mode` | Material profile: `constant`, `layered_x` |
-| `--mesh` | NURBS mesh file |
-| `-r N` | Refinement levels |
-| `-an N` | Auxiliary grid subdivisions per direction |
-| `--order N` | IGA polynomial order |
-| `--gmres-max-iter N` | Max GMRES iterations per solve |
+| `-system spd\|pml` | System type: real SPD cavity or complex PML radiation |
+| `-r N` | Mesh refinement levels |
+| `-o N` | NURBS polynomial order (fine space) |
+| `-f N` | Frequency (Hz) |
+| `-ao N` | Auxiliary NURBS order (default: 1; use o−1 for Π_{p−1→p}) |
+| `-m <file>` | NURBS mesh file (default: cube-nurbs.mesh) |
 
-## Directory structure
+## Directory Structure
 
 ```
-opt_em_iga/
+opt_em_iga_repo/
   README.md
+  PROGRESS.md                         # Detailed research progress log
   Makefile
-  fdfd_iga_init/           # Reference-space FDFD initial guess
-    README.md
-    single_patch_demo.cpp  # End-to-end driver
-    reference_fdfd_cpu.*   # CPU finite-difference solver
-    reference_fdfd_cuda.*  # CUDA stub interface
-    reference_initial_guess.*  # Field projection into H(curl)
-    reference_patch_evaluator.*  # NURBS geometry evaluation
-  covariant_aux_space/     # Auxiliary-space preconditioner
-    README.md
-    covariant_reference_preconditioner.*  # Preconditioner orchestrator
-    covariant_aux_preconditioner.*        # Preconditioner interface
-    yee_transfer.*          # Yee prolongation (fast local assembly)
-    yee_operator.*          # Yee coarse operator assembly
-  meshes/                  # Example NURBS meshes
-  run_proto_benchmark_matrix.sh   # Benchmark script
-  run_hp_proto_scan.sh            # HP parameter scan
-  run_hp_proto_scan_safe.sh       # HP scan with per-case timeout & logging
-  run_core_paper_cases.sh         # Four core paper cases and Markdown summary
-  tools/summarize_hp_scan.py      # CSV-to-Markdown summary helper
-  cuda_iterative_solver/          # Isolated CUDA Krylov solver sandbox
+  prec_selector.cpp                   # ★ Adaptive preconditioner selector (SPD + PML)
+  pml_pi_prec_test.cpp                # PML Pi-lumped preconditioner tests
+  pml_point_source_demo.cpp           # PML point-source radiation demo
+  plot_field.py                       # Field visualization helper
+  iga_ams_preconditioner/             # IGA AMS preconditioners
+    ams_sweep_v3.cpp                  #   SPD Pi_lumped HP sweep
+    ams_algebraic_diag.cpp            #   Algebraic diagonal diagnostics
+    ams_diagnostics.cpp               #   AMS diagnostics
+    ams_iga_coupled.cpp               #   Coupled IGA AMS
+    ams_q_preconditioner.cpp          #   Q-preconditioner variant
+    iga_ams_prec.*                    #   IGA AMS preconditioner library
+  covariant_aux_space/                # Covariant Yee auxiliary-space preconditioner
+    covariant_reference_preconditioner.*
+    covariant_aux_preconditioner.*
+    yee_transfer.*                    #   Yee prolongation (fast local assembly)
+    yee_operator.*                    #   Yee coarse operator assembly
+    iga_patch_ras_preconditioner.*    #   IGA patch-RAS Schwarz
+    IGA_NATIVE_SCHWARZ_PRECONDITIONER.md
+  pml_split_preconditioner/           # PML p-multigrid bridge prototype
+    pml_split_demo.cpp
+    split_pml_prec.*
+  fdfd_iga_init/                      # Reference-space FDFD initial guess
+  yee_init_guess/                     # Yee-to-IGA initial guess projection
+  cuda_iterative_solver/              # GPU BiCGStab solver sandbox
+  reference_precon/                   # Reference preconditioner design docs
+  meshes/                             # Example NURBS meshes
+  benchmark_results/                  # Benchmark output summaries
+  tools/                              # CSV/Markdown summary helpers
+  run_*.sh                            # Benchmark and sweep scripts
 ```
 
-## Performance note
+## Documentation
 
-The `edge_yee_proto` prolongation matrix `Π` is built via element-driven local
-assembly of the coupling matrix `B_ij = ∫ φ_i · w_j dx`, followed by a single
-mass-matrix backsolve. This avoids per-column global projections and achieves
-~700× speedup over the original per-column CG approach while preserving
-identical GMRES convergence.
+- **[PROGRESS.md](PROGRESS.md)** — Full research progress log with all sessions
+- **[HOW_TO_USE.md](HOW_TO_USE.md)** — Usage guide for key targets
+- **[SCI_PAPER_STRATEGY.md](SCI_PAPER_STRATEGY.md)** — Paper strategy and narrative
+- **[SCI_PAPER_PLAN.md](SCI_PAPER_PLAN.md)** — Detailed paper plan
+- **[IGA_RAS_PAPER_AND_API.md](IGA_RAS_PAPER_AND_API.md)** — IGA patch-RAS paper and API design
