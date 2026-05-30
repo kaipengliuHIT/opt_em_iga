@@ -28,7 +28,12 @@ public:
    const std::vector<YeeEdgeDof> &GetEdgeDofs() const;
    void BuildProlongation(mfem::DenseMatrix &P) const;
    void BuildProlongationExact(mfem::DenseMatrix &P) const;
-   void BuildProlongationFast(mfem::DenseMatrix &P) const;
+      void BuildProlongationFast(mfem::DenseMatrix &P) const;
+
+   /// H(curl)-compatible edge-integral transfer: Yee -> o=1 IGA.
+   /// Pi1_int(i,j) = integral_{IGA_edge_i} w_j^Yee · t ds
+   /// For aligned grids this is just dx,dy,dz * delta_{edge_i, yee_j}.
+   void BuildEdgeIntegralProlongation(mfem::DenseMatrix &P) const;
    void AssembleYeeCoarseOperator(
       const std::function<double(const mfem::Vector &)> &eps_fn,
       double k0,

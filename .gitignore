@@ -19,6 +19,21 @@ fdfd_iga_init_demo
 fdfd_iga_init_demo_debug
 minimal_demo
 pml_point_source_demo
+pml_point_source_demo_gpu
+pml_pi_prec_test
+pml_split_demo
+prec_selector
+ams_algebraic_diag
+ams_diagnostics
+ams_iga_coupled
+ams_q_preconditioner
+ams_sweep
+ams_sweep_v2
+ams_sweep_v3
+iga_ams_demo
+gpu_bicgstab_demo_cpu
+gpu_bicgstab_demo_gpu
+yee_init_guess_demo
 
 # Temporary/backup source snapshots
 *.bak

@@ -445,6 +445,40 @@ std::complex<double> YeeOperatorBuilder::PMLMassWeightComplex(
    return det / (s[axis] * s[axis]);
 }
 
+std::complex<double> YeeOperatorBuilder::EdgeSqrtInvStretchProduct(
+   const YeeEdgeDof &edge, double k0) const
+{
+   if (!pml_enabled_) { return {1.0, 0.0}; }
+
+   GridMapper map(grid_);
+   double xi[3];
+   if (edge.axis == 0)
+   {
+      xi[0] = map.edge_x(edge.i);
+      xi[1] = map.node_y(edge.j);
+      xi[2] = map.node_z(edge.k);
+   }
+   else if (edge.axis == 1)
+   {
+      xi[0] = map.node_x(edge.i);
+      xi[1] = map.edge_y(edge.j);
+      xi[2] = map.node_z(edge.k);
+   }
+   else
+   {
+      xi[0] = map.node_x(edge.i);
+      xi[1] = map.node_y(edge.j);
+      xi[2] = map.edge_z(edge.k);
+   }
+
+   std::complex<double> dinv(1.0, 0.0);
+   for (int d = 0; d < 3; d++)
+   {
+      dinv *= std::sqrt(1.0 / StretchFactor(xi[d], k0));
+   }
+   return dinv;
+}
+
 void YeeOperatorBuilder::BuildCurlIncidence(mfem::DenseMatrix &C) const
 {
    BuildEdgeDofs();
@@ -764,6 +798,35 @@ void YeeOperatorBuilder::AssembleYeeMaxwellOperatorComplex(
    for (int i = 0; i < ne; i++)
    {
       Areal(i, i) -= k0 * k0 * Meps(i, i);
+   }
+}
+
+void YeeOperatorBuilder::AssembleYeeMaxwellOperatorComplexSqrtScaled(
+   const std::function<double(const mfem::Vector &)> &eps_fn,
+   double k0,
+   mfem::DenseMatrix &Areal,
+   mfem::DenseMatrix &Aimag) const
+{
+   AssembleYeeMaxwellOperatorComplex(eps_fn, k0, Areal, Aimag);
+   if (!pml_enabled_) { return; }
+
+   BuildEdgeDofs();
+   const int ne = static_cast<int>(edge_dofs_.size());
+   std::vector<std::complex<double>> dinv(ne);
+   for (int i = 0; i < ne; i++)
+   {
+      dinv[i] = EdgeSqrtInvStretchProduct(edge_dofs_[i], k0);
+   }
+
+   for (int i = 0; i < ne; i++)
+   {
+      for (int j = 0; j < ne; j++)
+      {
+         const std::complex<double> a(Areal(i, j), Aimag(i, j));
+         const std::complex<double> v = dinv[i] * a * dinv[j];
+         Areal(i, j) = v.real();
+         Aimag(i, j) = v.imag();
+      }
    }
 }
 

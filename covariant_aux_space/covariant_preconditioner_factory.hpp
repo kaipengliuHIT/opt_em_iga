@@ -3,6 +3,7 @@
 
 #include "mfem.hpp"
 #include "covariant_reference_preconditioner.hpp"
+#include "iga_patch_ras_preconditioner.hpp"
 #include "../fdfd_iga_init/reference_patch_evaluator.hpp"
 #include <memory>
 #include <functional>
@@ -68,6 +69,26 @@ struct PreconditionerConfig
    double gmres_abs_tol   = 0.0;
 };
 
+/// Configuration for the IGA-native full-rank patch Schwarz preconditioner.
+///
+/// This path does not use a Yee/FDFD auxiliary grid. It is built directly from
+/// the true real 2x2 IGA operator and is intended as the robust PML/high-order
+/// fallback when auxiliary-space operator equivalence is not reliable.
+struct IGAPatchRASConfig
+{
+   int overlap_layers = 0;
+   double damping = 0.8;
+   int iterations = 1;
+   bool verbose = true;
+   IGAPatchRASPreconditioner::Options::Assembly assembly =
+      IGAPatchRASPreconditioner::Options::Assembly::Auto;
+
+   int gmres_max_iter = 500;
+   int gmres_print = 0;
+   double gmres_rel_tol = 1e-5;
+   double gmres_abs_tol = 0.0;
+};
+
 /// Return a short human-readable label for the configuration,
 /// useful for benchmark table column headers.
 inline std::string PreconditionerLabel(const PreconditionerConfig &cfg)
@@ -81,6 +102,11 @@ inline std::string PreconditionerLabel(const PreconditionerConfig &cfg)
    }
    if (cfg.no_pml_fallback) label += "_nopf";  // no PML fallback
    return label;
+}
+
+inline std::string PreconditionerLabel(const IGAPatchRASConfig &cfg)
+{
+   return "iga_ras_ov" + std::to_string(cfg.overlap_layers);
 }
 
 /// Factory: create a covariant auxiliary-space preconditioner from a config.
@@ -139,12 +165,46 @@ CreateCovariantPreconditioner(
    return prec;
 }
 
+/// Factory for the IGA-native full-rank patch Schwarz preconditioner.
+inline std::unique_ptr<IGAPatchRASPreconditioner>
+CreateIGAPatchRASPreconditioner(
+   const mfem::Operator &A,
+   const mfem::ParFiniteElementSpace &fespace,
+   const IGAPatchRASConfig &cfg = IGAPatchRASConfig{})
+{
+   IGAPatchRASPreconditioner::Options opts;
+   opts.overlap_layers = cfg.overlap_layers;
+   opts.damping = cfg.damping;
+   opts.iterations = cfg.iterations;
+   opts.verbose = cfg.verbose;
+   opts.assembly = cfg.assembly;
+   return std::make_unique<IGAPatchRASPreconditioner>(A, fespace, opts);
+}
+
 /// Convenience: create and configure a GMRES solver with the preconditioner.
 inline mfem::GMRESSolver
 CreatePreconditionedGMRES(
    const mfem::Operator &A,
    CovariantReferencePreconditioner &prec,
    const PreconditionerConfig &cfg = PreconditionerConfig{})
+{
+   mfem::GMRESSolver gmres;
+   gmres.SetAbsTol(cfg.gmres_abs_tol);
+   gmres.SetRelTol(cfg.gmres_rel_tol);
+   gmres.SetMaxIter(cfg.gmres_max_iter);
+   gmres.SetPrintLevel(cfg.gmres_print);
+   gmres.SetOperator(A);
+   gmres.SetPreconditioner(prec);
+   return gmres;
+}
+
+/// Convenience: create and configure GMRES with an IGA-native RAS
+/// preconditioner.
+inline mfem::GMRESSolver
+CreatePreconditionedGMRES(
+   const mfem::Operator &A,
+   IGAPatchRASPreconditioner &prec,
+   const IGAPatchRASConfig &cfg = IGAPatchRASConfig{})
 {
    mfem::GMRESSolver gmres;
    gmres.SetAbsTol(cfg.gmres_abs_tol);

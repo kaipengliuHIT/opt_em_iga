@@ -24,6 +24,8 @@
 #include "mfem.hpp"
 #include "fdfd_iga_init/reference_patch_evaluator.hpp"
 #include "covariant_aux_space/covariant_reference_preconditioner.hpp"
+#include "covariant_aux_space/iga_patch_ras_preconditioner.hpp"
+#include "cuda_iterative_solver/gpu_bicgstab.hpp"
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -31,6 +33,8 @@
 #include <iomanip>
 #include <memory>
 #include <limits>
+#include <algorithm>
+#include <vector>
 
 using namespace std;
 using namespace mfem;
@@ -116,17 +120,30 @@ private:
    const real_t abs_tol_;
    const int print_every_;
    const int rank_;
+   MPI_Comm comm_;
    mutable Vector residual_;
    int last_iter_ = -1;
    real_t last_norm_ = numeric_limits<real_t>::infinity();
    real_t last_rel_ = numeric_limits<real_t>::infinity();
 
 public:
+   // Compute the global (all-rank) L2 norm of a distributed plain Vector.
+   // Each rank contributes its local entries; MPI_Allreduce sums the squares.
+   static real_t GlobalNorml2(const Vector &v, MPI_Comm comm)
+   {
+      double local_sq = static_cast<double>(v.Norml2());
+      local_sq *= local_sq;
+      double global_sq = 0.0;
+      MPI_Allreduce(&local_sq, &global_sq, 1, MPI_DOUBLE, MPI_SUM, comm);
+      return static_cast<real_t>(std::sqrt(global_sq));
+   }
+
    TrueResidualController(const Operator &A, const Vector &B,
                           real_t bnorm, real_t rel_tol, real_t abs_tol,
-                          int print_every, int rank)
+                          int print_every, int rank,
+                          MPI_Comm comm = MPI_COMM_WORLD)
       : A_(A), B_(B), bnorm_(bnorm), rel_tol_(rel_tol), abs_tol_(abs_tol),
-        print_every_(print_every), rank_(rank)
+        print_every_(print_every), rank_(rank), comm_(comm)
    {
       residual_.SetSize(B.Size());
    }
@@ -147,7 +164,7 @@ public:
       residual_ *= -1.0;
       residual_ += B_;
       last_iter_ = it;
-      last_norm_ = residual_.Norml2();
+      last_norm_ = GlobalNorml2(residual_, comm_);
       last_rel_ = (bnorm_ > 0.0) ? last_norm_ / bnorm_ : last_norm_;
 
       const bool true_stop =
@@ -216,6 +233,7 @@ int main(int argc, char *argv[])
    bool visualization = 0;
    real_t freq = 5.0;
    std::string prec_mode = "ams";
+   std::string solver_mode = "gmres"; // gmres | bicgstab_cpu | bicgstab_gpu
    int aux_n = 7;
    int gmres_max_iter = 10000;
    int gmres_print = 0;
@@ -227,6 +245,9 @@ int main(int argc, char *argv[])
    bool knot_align = false;
    bool no_pml_fallback = false;
    bool yee_calib = true;
+   bool yee_local_calib = false;
+   bool yee_masked_galerkin_calib = false;
+   int yee_galerkin_block_radius = 0;
    real_t coarse_correction_weight = 1.0;
    real_t yee_curl_scale = 1.0;
    real_t yee_mass_scale = 1.0;
@@ -235,8 +256,26 @@ int main(int argc, char *argv[])
    int jacobi_smoother_iterations = 1;
    real_t block_jacobi_smoother_weight = 0.0;
    int block_jacobi_smoother_iterations = 1;
+   real_t patch_block_smoother_weight = 0.0;
+   int patch_block_size = 8;
+   int patch_block_smoother_iterations = 1;
+   bool element_patch_blocks = false;
+   bool patch_block_use_prec_op = false;
+   bool mfem_block_aux = false;
+   bool yee_iterative_aux_solve = false;
+   bool yee_sparse_aux_solve = false;
+   bool yee_gmres_aux_solve = false;
+   bool yee_bicgstab_aux_solve = false;
+   bool yee_complex_auxiliary = false;
+   bool yee_sqrt_pml_scaling = false;
+   int yee_iterative_aux_max_iter = 80;
+   real_t yee_iterative_aux_rel_tol = 1e-8;
    bool true_residual_control = false;
    int true_residual_print_every = 0;
+   int iga_ras_overlap = 0;
+   real_t iga_ras_damping = 1.0;
+   int iga_ras_iterations = 1;
+   std::string iga_ras_assembly = "auto";
 
    OptionsParser args(argc, argv);
    args.AddOption(&mesh_file, "-m", "--mesh",
@@ -247,8 +286,12 @@ int main(int argc, char *argv[])
                   "Finite element order (polynomial degree).");
    args.AddOption(&freq, "-f", "--frequency", "Set the frequency for the exact"
                   " solution.");
+   args.AddOption(&solver_mode, "-solver", "--solver",
+                  "Krylov solver: gmres, bicgstab_cpu, bicgstab_gpu."
+                  " bicgstab_cpu/gpu require -prec iga_ras."
+                  " bicgstab_gpu requires HAVE_CUDA build.");
    args.AddOption(&prec_mode, "-prec", "--preconditioner",
-                  "Preconditioner: none, ams, amg, edge_galerkin, or edge_yee.");
+                  "Preconditioner: none, ams, amg, iga_ras, edge_galerkin, or edge_yee.");
    args.AddOption(&aux_n, "-an", "--aux-n",
                   "Auxiliary Yee grid points per direction for edge_yee.");
    args.AddOption(&gmres_max_iter, "-gmi", "--gmres-max-iter",
@@ -279,6 +322,19 @@ int main(int argc, char *argv[])
                   "-no-ycal", "--no-yee-calib",
                   "Calibrate Yee coarse operator diagonal mean to match the "
                   "IGA Galerkin restriction P^T A_h P (mesh-dependent fix).");
+   args.AddOption(&yee_local_calib, "-ylcal", "--yee-local-calib",
+                  "-no-ylcal", "--no-yee-local-calib",
+                  "Apply local diagonal Galerkin calibration S A_yee S using "
+                  "diag(Pi^T A_ref Pi).");
+   args.AddOption(&yee_masked_galerkin_calib, "-ymgal",
+                  "--yee-masked-galerkin",
+                  "-no-ymgal", "--no-yee-masked-galerkin",
+                  "Replace Yee coarse entries by Pi^T A_ref Pi values on the "
+                  "Yee nonzero stencil only.");
+   args.AddOption(&yee_galerkin_block_radius, "-ygbr",
+                  "--yee-galerkin-block-radius",
+                  "Use Pi^T A_ref Pi entries inside a local auxiliary edge "
+                  "index block of this radius; 0 disables.");
    args.AddOption(&coarse_correction_weight, "-cw", "--coarse-weight",
                   "Weight multiplying the auxiliary coarse correction "
                   "Pi Aaux^{-1} Pi^T r. Use 0 for smoother-only ablations.");
@@ -300,6 +356,62 @@ int main(int argc, char *argv[])
    args.AddOption(&block_jacobi_smoother_iterations, "-sbjit",
                   "--block-jacobi-smoother-iters",
                   "Number of weighted 2x2 block-Jacobi smoothing iterations.");
+   args.AddOption(&patch_block_smoother_weight, "-spjac",
+                  "--patch-block-smoother",
+                  "Add omega times non-overlapping true-DOF patch block "
+                  "Jacobi correction using the full real/imag operator block.");
+   args.AddOption(&patch_block_size, "-spbs", "--patch-block-size",
+                  "Number of true DOFs per non-overlapping patch block.");
+   args.AddOption(&element_patch_blocks, "-spel", "--element-patch-blocks",
+                  "-no-spel", "--no-element-patch-blocks",
+                  "Use non-overlapping element-aggregate true-DOF blocks "
+                  "instead of contiguous true-DOF blocks.");
+   args.AddOption(&patch_block_use_prec_op, "-sppc",
+                  "--patch-block-use-prec-op",
+                  "-no-sppc", "--no-patch-block-use-prec-op",
+                  "Build patch block smoother from the positive abs-PML "
+                  "preconditioner operator instead of the indefinite system.");
+   args.AddOption(&mfem_block_aux, "-mfbaux", "--mfem-block-aux",
+                  "-no-mfbaux", "--no-mfem-block-aux",
+                  "Use the auxiliary preconditioner as the real diagonal block "
+                  "inside MFEM's 2x2 complex BlockDiagonalPreconditioner.");
+   args.AddOption(&yee_iterative_aux_solve, "-yits",
+                  "--yee-iterative-solve",
+                  "-no-yits", "--no-yee-iterative-solve",
+                  "Use inner CG on the Yee auxiliary operator instead of a "
+                  "dense direct inverse.");
+   args.AddOption(&yee_sparse_aux_solve, "-ysparse",
+                  "--yee-sparse-solve",
+                  "-no-ysparse", "--no-yee-sparse-solve",
+                  "Store the Yee auxiliary operator as MFEM SparseMatrix and "
+                  "use diagonal-preconditioned inner iterations. Requires -yits.");
+   args.AddOption(&yee_gmres_aux_solve, "-ygmres",
+                  "--yee-gmres-solve",
+                  "-no-ygmres", "--no-yee-gmres-solve",
+                  "Use inner GMRES for the Yee auxiliary solve instead of CG. "
+                  "This is intended for indefinite Yee/PML operators.");
+   args.AddOption(&yee_bicgstab_aux_solve, "-ybicg",
+                  "--yee-bicgstab-solve",
+                  "-no-ybicg", "--no-yee-bicgstab-solve",
+                  "Use inner BiCGSTAB for the Yee auxiliary solve.");
+   args.AddOption(&yee_complex_auxiliary, "-ycx",
+                  "--yee-complex-aux",
+                  "-no-ycx", "--no-yee-complex-aux",
+                  "Use a coupled 2x2 real block complex Yee auxiliary operator.");
+   args.AddOption(&yee_sqrt_pml_scaling, "-yxsqrt",
+                  "--yee-sqrt-pml-scaling",
+                  "-no-yxsqrt", "--no-yee-sqrt-pml-scaling",
+                  "Apply maxwellb-style sqrt(PML stretch) left/right scaling "
+                  "to the complex Yee auxiliary operator.");
+   args.AddOption(&yee_iterative_aux_max_iter, "-yitmax",
+                  "--yee-iterative-max-it",
+                  "Maximum inner Krylov iterations for the Yee auxiliary solve.");
+   args.AddOption(&yee_iterative_aux_rel_tol, "-yittol",
+                  "--yee-iterative-rel-tol",
+                  "Relative tolerance for inner Krylov on the Yee auxiliary solve.");
+   args.AddOption(&patch_block_smoother_iterations, "-spjit",
+                  "--patch-block-smoother-iters",
+                  "Number of weighted patch block-Jacobi smoothing iterations.");
    args.AddOption(&true_residual_control, "-trc", "--true-residual-control",
                   "-no-trc", "--no-true-residual-control",
                   "Stop GMRES using the unpreconditioned true residual norm.");
@@ -307,6 +419,15 @@ int main(int argc, char *argv[])
                   "--true-residual-print-every",
                   "Print true residual every N iterations when -trc is enabled "
                   "(0=only final summary).");
+   args.AddOption(&iga_ras_overlap, "-rasov", "--ras-overlap",
+                  "Element-neighbor overlap layers for IGA-native RAS patches.");
+   args.AddOption(&iga_ras_damping, "-rasw", "--ras-weight",
+                  "Damping factor for IGA-native RAS patch corrections.");
+   args.AddOption(&iga_ras_iterations, "-rasit", "--ras-iters",
+                  "Number of multiplicative residual-update sweeps inside "
+                  "one IGA-native RAS preconditioner application.");
+   args.AddOption(&iga_ras_assembly, "-rasasm", "--ras-assembly",
+                  "IGA-native RAS assembly mode: auto, local_sparse, or dense_probe.");
    args.AddOption(&pa, "-pa", "--partial-assembly", "-no-pa",
                   "--no-partial-assembly", "Enable Partial Assembly.");
    args.AddOption(&device_config, "-d", "--device",
@@ -319,6 +440,11 @@ int main(int argc, char *argv[])
    {
       args.PrintUsage(cout);
       return 1;
+   }
+   if (false) // placeholder: MPI guard removed; -trc is now collective-safe
+   {
+      // (kept as dead code block so nearby line numbers stay stable)
+      (void)myid;
    }
    if (myid == 0 )
    {
@@ -527,6 +653,7 @@ int main(int argc, char *argv[])
    BlockDiagonalPreconditioner BlockDP(offsets);
    std::unique_ptr<fdfd_iga_init::SinglePatchNURBSEvaluator> geom;
    std::unique_ptr<covariant_aux_space::CovariantReferencePreconditioner> edge_prec;
+   std::unique_ptr<covariant_aux_space::IGAPatchRASPreconditioner> iga_ras_prec;
 
    if (prec_mode == "ams")
    {
@@ -555,6 +682,35 @@ int main(int argc, char *argv[])
       pc_i.reset(new ScaledOperator(pc_r.get(), s));
       BlockDP.SetDiagonalBlock(0, pc_r.get());
       BlockDP.SetDiagonalBlock(1, pc_i.get());
+   }
+   else if (prec_mode == "iga_ras")
+   {
+      if (myid == 0)
+      {
+         cout << "\n" << string(80, '-') << endl;
+         cout << "Using IGA-native overlapping patch RAS preconditioner..."
+              << endl;
+      }
+      covariant_aux_space::IGAPatchRASPreconditioner::Options ras_opts;
+      ras_opts.overlap_layers = iga_ras_overlap;
+      ras_opts.damping = iga_ras_damping;
+      ras_opts.iterations = iga_ras_iterations;
+      if (iga_ras_assembly == "local_sparse")
+      {
+         ras_opts.assembly =
+            covariant_aux_space::IGAPatchRASPreconditioner::Options::Assembly::LocalSparse;
+      }
+      else if (iga_ras_assembly == "dense_probe")
+      {
+         ras_opts.assembly =
+            covariant_aux_space::IGAPatchRASPreconditioner::Options::Assembly::DenseProbe;
+      }
+      else if (iga_ras_assembly != "auto")
+      {
+         MFEM_ABORT("Unknown -rasasm value. Use auto, local_sparse, or dense_probe.");
+      }
+      iga_ras_prec = make_unique<covariant_aux_space::IGAPatchRASPreconditioner>(
+         *A, *fespace, ras_opts);
    }
    else if (prec_mode == "edge_yee" || prec_mode == "edge_galerkin")
    {
@@ -590,10 +746,32 @@ int main(int argc, char *argv[])
       edge_prec->SetYeeComponentScales(yee_curl_scale, yee_mass_scale);
       edge_prec->SetCoarseCorrectionWeight(coarse_correction_weight);
       edge_prec->SetIdentitySmootherWeight(identity_smoother_weight);
+      edge_prec->SetRealBlockMode(mfem_block_aux);
+      edge_prec->SetYeeIterativeAuxiliarySolve(yee_iterative_aux_solve);
+      edge_prec->SetYeeSparseAuxiliarySolve(yee_sparse_aux_solve);
+      edge_prec->SetYeeGMRESAuxiliarySolve(yee_gmres_aux_solve);
+      edge_prec->SetYeeBiCGSTABAuxiliarySolve(yee_bicgstab_aux_solve);
+      edge_prec->SetYeeComplexAuxiliary(yee_complex_auxiliary);
+      edge_prec->SetYeeSqrtPMLScaling(yee_sqrt_pml_scaling);
+      edge_prec->SetYeeIterativeAuxiliaryOptions(
+         yee_iterative_aux_max_iter, yee_iterative_aux_rel_tol);
       edge_prec->SetOperatorJacobiSmootherWeight(jacobi_smoother_weight);
       edge_prec->SetOperatorJacobiSmootherIterations(jacobi_smoother_iterations);
       edge_prec->SetOperatorBlockJacobiSmootherWeight(block_jacobi_smoother_weight);
       edge_prec->SetOperatorBlockJacobiSmootherIterations(block_jacobi_smoother_iterations);
+      edge_prec->SetOperatorPatchBlockSmootherWeight(patch_block_smoother_weight);
+      edge_prec->SetOperatorPatchBlockReferenceOperator(*PCOpAh);
+      edge_prec->SetOperatorPatchBlockUseReference(patch_block_use_prec_op);
+      edge_prec->SetOperatorElementPatchBlocks(element_patch_blocks);
+      edge_prec->SetOperatorPatchBlockSize(patch_block_size);
+      edge_prec->SetOperatorPatchBlockSmootherIterations(patch_block_smoother_iterations);
+      if (prec_mode == "edge_yee")
+      {
+         edge_prec->SetYeeCalibrationOperator(*PCOpAh);
+         edge_prec->SetYeeLocalDiagonalCalibration(yee_local_calib);
+         edge_prec->SetYeeMaskedGalerkinCalibration(yee_masked_galerkin_calib);
+         edge_prec->SetYeeGalerkinBlockRadius(yee_galerkin_block_radius);
+      }
       if (prec_mode == "edge_yee" && yee_calib)
       {
          edge_prec->SetYeeDiagonalCalibration(true);
@@ -622,8 +800,20 @@ int main(int argc, char *argv[])
                  << ")." << endl;
          }
       }
-      edge_prec->SetOperator(*A);
-      if (diagnose_yee && prec_mode == "edge_yee" && myid == 0)
+      edge_prec->SetOperator(mfem_block_aux ? *PCOpAh : *A);
+      if (mfem_block_aux)
+      {
+         pc_r.reset(edge_prec.release());
+         pc_i.reset(new ScaledOperator(pc_r.get(), s));
+         BlockDP.SetDiagonalBlock(0, pc_r.get());
+         BlockDP.SetDiagonalBlock(1, pc_i.get());
+         if (myid == 0)
+         {
+            cout << "[edge_aux] using MFEM 2x2 block diagonal wrapper."
+                 << endl;
+         }
+      }
+      if (diagnose_yee && !mfem_block_aux && prec_mode == "edge_yee" && myid == 0)
       {
          mfem::DenseMatrix AyeeCurl, AyeeMass;
          covariant_aux_space::YeeOperatorBuilder yee_diag_builder(*geom);
@@ -653,7 +843,7 @@ int main(int argc, char *argv[])
    }
    else if (prec_mode != "none")
    {
-      MFEM_ABORT("Unknown preconditioner. Use none, ams, amg, edge_galerkin, or edge_yee.");
+      MFEM_ABORT("Unknown preconditioner. Use none, ams, amg, iga_ras, edge_galerkin, or edge_yee.");
    }
 
    GMRESSolver gmres(MPI_COMM_WORLD);
@@ -663,7 +853,7 @@ int main(int argc, char *argv[])
    gmres.SetRelTol(gmres_rel_tol);
    gmres.SetAbsTol(0.0);
    gmres.SetOperator(*A);
-   if (prec_mode == "ams" || prec_mode == "amg")
+   if (prec_mode == "ams" || prec_mode == "amg" || mfem_block_aux)
    {
       gmres.SetPreconditioner(BlockDP);
    }
@@ -671,13 +861,17 @@ int main(int argc, char *argv[])
    {
       gmres.SetPreconditioner(*edge_prec);
    }
+   else if (prec_mode == "iga_ras")
+   {
+      gmres.SetPreconditioner(*iga_ras_prec);
+   }
 
    Vector R0(B.Size());
    A->Mult(X, R0);
    R0 *= -1.0;
    R0 += B;
-   const real_t r0 = R0.Norml2();
-   const real_t bnorm = B.Norml2();
+   const real_t r0 = TrueResidualController::GlobalNorml2(R0, MPI_COMM_WORLD);
+   const real_t bnorm = TrueResidualController::GlobalNorml2(B, MPI_COMM_WORLD);
    if (myid == 0)
    {
       cout << "[PML GMRES] " << prec_mode
@@ -697,34 +891,93 @@ int main(int argc, char *argv[])
       true_controller.reset(new TrueResidualController(*A, B, bnorm,
                                                        gmres_rel_tol, 0.0,
                                                        true_residual_print_every,
-                                                       myid));
+                                                       myid,
+                                                       MPI_COMM_WORLD));
       gmres.SetController(*true_controller);
    }
 
-   gmres.Mult(B, X);
+   if (solver_mode == "gmres")
+   {
+      gmres.Mult(B, X);
 
-   Vector R1(B.Size());
-   A->Mult(X, R1);
-   R1 *= -1.0;
-   R1 += B;
-   const real_t r1 = R1.Norml2();
-   const bool true_converged =
-      (bnorm > 0.0) ? (r1 / bnorm <= gmres_rel_tol) : (r1 <= gmres_rel_tol);
+      Vector R1(B.Size());
+      A->Mult(X, R1);
+      R1 *= -1.0;
+      R1 += B;
+      const real_t r1 = TrueResidualController::GlobalNorml2(R1, MPI_COMM_WORLD);
+      const bool true_converged =
+         (bnorm > 0.0) ? (r1 / bnorm <= gmres_rel_tol) : (r1 <= gmres_rel_tol);
+
+      if (myid == 0)
+      {
+         cout << "[PML GMRES] " << prec_mode
+              << " done  ||rN||=" << r1;
+         if (bnorm > 0.0) { cout << " (rel=" << r1 / bnorm << ")"; }
+         cout << ", iters=" << gmres.GetNumIterations()
+              << ", converged=" << gmres.GetConverged()
+              << ", true_converged=" << true_converged << "\n";
+         cout << " Preconditioner: " << prec_mode << "\n";
+         cout << string(80, '-') << endl;
+      }
+   }
+   else if (solver_mode == "bicgstab_cpu" || solver_mode == "bicgstab_gpu")
+   {
+      MFEM_VERIFY(prec_mode == "iga_ras" && iga_ras_prec,
+                  "bicgstab_cpu/gpu require -prec iga_ras.");
+
+      gpu_solver::BiCGSTABOptions bicg_opts;
+      bicg_opts.max_iters   = gmres_max_iter;
+      bicg_opts.rel_tol     = gmres_rel_tol;
+      bicg_opts.print_every = 50;
+      bicg_opts.verbose     = (myid == 0);
+
+      gpu_solver::BiCGSTABResult res;
+      if (solver_mode == "bicgstab_gpu")
+      {
+#ifdef HAVE_CUDA
+         gpu_solver::GpuBiCGSTABSolver solver(*A, *iga_ras_prec, bicg_opts);
+         if (myid == 0)
+         {
+            cout << "[BiCGSTAB-GPU] patch_inv gpu_MB="
+                 << solver.GpuAllocBytes() / (1024 * 1024)
+                 << "  (SpMV on CPU/Hypre, patch solves on GPU)\n";
+         }
+         res = solver.Solve(B, X);
+#else
+         MFEM_ABORT("bicgstab_gpu requires -DHAVE_CUDA build: "
+                    "use 'make pml_point_source_demo_gpu'.");
+#endif
+      }
+      else
+      {
+         gpu_solver::CpuBiCGSTABSolver solver(*A, iga_ras_prec.get(), bicg_opts);
+         res = solver.Solve(B, X);
+      }
+
+      Vector R1(B.Size());
+      A->Mult(X, R1);
+      R1 *= -1.0;
+      R1 += B;
+      const real_t r1 = TrueResidualController::GlobalNorml2(R1, MPI_COMM_WORLD);
+
+      if (myid == 0)
+      {
+         cout << "[" << solver_mode << "] iga_ras"
+              << "  iters=" << res.iters
+              << "  converged=" << res.converged
+              << "  final_rel=" << res.final_rel
+              << "  true_rel=" << (bnorm > 0.0 ? r1 / bnorm : r1)
+              << "  solve_s=" << res.solve_seconds << "\n";
+         cout << string(80, '-') << endl;
+      }
+   }
+   else
+   {
+      MFEM_ABORT("Unknown -solver. Use gmres, bicgstab_cpu, or bicgstab_gpu.");
+   }
 
    // 12. Recover the solution as a finite element grid function.
    a.RecoverFEMSolution(X, b, x);
-
-   if (myid == 0)
-   {
-      cout << "[PML GMRES] " << prec_mode
-           << " done  ||rN||=" << r1;
-      if (bnorm > 0.0) { cout << " (rel=" << r1 / bnorm << ")"; }
-      cout << ", iters=" << gmres.GetNumIterations()
-           << ", converged=" << gmres.GetConverged()
-           << ", true_converged=" << true_converged << "\n";
-      cout << " Preconditioner: " << prec_mode << "\n";
-      cout << string(80, '-') << endl;
-   }
 
    // 13. Save the refined mesh and the solution in parallel. This output can be
    //     viewed later using GLVis: "glvis -np <np> -m refined.mesh -g sol_r.gf -g sol_i.gf".

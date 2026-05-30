@@ -66,6 +66,11 @@ public:
       double k0,
       mfem::DenseMatrix &Areal,
       mfem::DenseMatrix &Aimag) const;
+   void AssembleYeeMaxwellOperatorComplexSqrtScaled(
+      const std::function<double(const mfem::Vector &)> &eps_fn,
+      double k0,
+      mfem::DenseMatrix &Areal,
+      mfem::DenseMatrix &Aimag) const;
 
    void PrintDiagnostics(
       const std::function<double(const mfem::Vector &)> &eps_fn,
@@ -100,6 +105,8 @@ private:
                                              double k0) const;
    std::complex<double> PMLMassWeightComplex(const mfem::Vector &xi, int axis,
                                              double k0) const;
+   std::complex<double> EdgeSqrtInvStretchProduct(const YeeEdgeDof &edge,
+                                                  double k0) const;
 };
 
 } // namespace covariant_aux_space

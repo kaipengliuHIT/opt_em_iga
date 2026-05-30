@@ -24,6 +24,35 @@ const char *ModeName(CovariantReferencePreconditioner::PrototypeMode mode)
    return "unknown";
 }
 
+class DiagonalAbsInverseSolver : public mfem::Solver
+{
+public:
+   explicit DiagonalAbsInverseSolver(const mfem::Vector &inv_diag)
+      : mfem::Solver(inv_diag.Size(), inv_diag.Size()),
+        inv_diag_(inv_diag)
+   {
+   }
+
+   void Mult(const mfem::Vector &x, mfem::Vector &y) const override
+   {
+      const int n = inv_diag_.Size();
+      y.SetSize(n);
+      for (int i = 0; i < n; i++)
+      {
+         y[i] = inv_diag_[i] * x[i];
+      }
+   }
+
+   void SetOperator(const mfem::Operator &op) override
+   {
+      MFEM_VERIFY(op.Height() == height && op.Width() == width,
+                  "DiagonalAbsInverseSolver operator size mismatch.");
+   }
+
+private:
+   mfem::Vector inv_diag_;
+};
+
 }
 
 CovariantReferencePreconditioner::CovariantReferencePreconditioner(
@@ -52,6 +81,8 @@ void CovariantReferencePreconditioner::MarkDirty()
    Aaux_.SetSize(0, 0);
    AauxImag_.SetSize(0, 0);
    AauxBlock_.SetSize(0, 0);
+   AauxSparse_.reset();
+   AauxSparsePrec_.reset();
    AauxInv_.reset();
    AauxBlockInv_.reset();
    aux_rhs_.SetSize(0);
@@ -69,6 +100,15 @@ void CovariantReferencePreconditioner::MarkDirty()
    op_block_jacobi_work_.SetSize(0);
    op_block_jacobi_res_.SetSize(0);
    op_block_jacobi_Awork_.SetSize(0);
+   op_patch_block_starts_.clear();
+   op_patch_block_sizes_.clear();
+   op_patch_block_indices_.clear();
+   op_patch_block_mats_.clear();
+   op_patch_block_invs_.clear();
+   op_patch_block_scalar_ = false;
+   op_patch_block_work_.SetSize(0);
+   op_patch_block_res_.SetSize(0);
+   op_patch_block_Awork_.SetSize(0);
 }
 
 void CovariantReferencePreconditioner::SetOperator(const mfem::Operator &op)
@@ -140,7 +180,6 @@ void CovariantReferencePreconditioner::SetYeeReferencePML(
    bool enabled, double thickness, double strength, double order)
 {
    yee_operator_->SetReferencePML(enabled, thickness, strength, order);
-   yee_complex_auxiliary_ = false;
    MarkDirty();
 }
 
@@ -352,17 +391,27 @@ void CovariantReferencePreconditioner::BuildAuxiliaryMatrix() const
       const bool pml_active = yee_operator_->IsReferencePMLEnabled();
       if (pml_active && yee_pml_galerkin_fallback_)
       {
-         BuildGalerkinEdgeCoarseMatrix(Aaux_);
+         const mfem::Operator &fallback_op =
+            yee_calibration_op_ ? *yee_calibration_op_ : *op_;
+         BuildGalerkinEdgeCoarseMatrix(fallback_op, Aaux_);
          if (mfem::Mpi::WorldRank() == 0)
          {
             mfem::out << "[covariant_aux_space] edge_yee_proto: PML active, "
-                      << "using full Pi^T A_h Pi Galerkin restriction\n";
+                      << "using Pi^T A_abs Pi Galerkin restriction (SPD)\n";
          }
       }
       else if (yee_complex_auxiliary_)
       {
-         yee_operator_->AssembleYeeMaxwellOperatorComplex(eps_fn_, k0_,
-                                                          Aaux_, AauxImag_);
+         if (yee_sqrt_pml_scaling_)
+         {
+            yee_operator_->AssembleYeeMaxwellOperatorComplexSqrtScaled(
+               eps_fn_, k0_, Aaux_, AauxImag_);
+         }
+         else
+         {
+            yee_operator_->AssembleYeeMaxwellOperatorComplex(eps_fn_, k0_,
+                                                             Aaux_, AauxImag_);
+         }
       }
       else
       {
@@ -371,7 +420,9 @@ void CovariantReferencePreconditioner::BuildAuxiliaryMatrix() const
       if (yee_diag_calibration_)
       {
          mfem::DenseMatrix Agal;
-         BuildGalerkinEdgeCoarseMatrix(Agal);
+         const mfem::Operator &calib_op =
+            yee_calibration_op_ ? *yee_calibration_op_ : *op_;
+         BuildGalerkinEdgeCoarseMatrix(calib_op, Agal);
          const int n = Aaux_.Height();
          double gal_diag_mean = 0.0;
          double yee_diag_mean = 0.0;
@@ -385,6 +436,144 @@ void CovariantReferencePreconditioner::BuildAuxiliaryMatrix() const
          const double alpha = (yee_diag_mean > 0.0) ? gal_diag_mean / yee_diag_mean : 1.0;
          Aaux_ *= alpha;
          if (AauxImag_.Height() == n) { AauxImag_ *= alpha; }
+      }
+      if (yee_local_diag_calibration_)
+      {
+         mfem::DenseMatrix Agal;
+         const mfem::Operator &calib_op =
+            yee_calibration_op_ ? *yee_calibration_op_ : *op_;
+         BuildGalerkinEdgeCoarseMatrix(calib_op, Agal);
+         const int n = Aaux_.Height();
+         mfem::Vector scale(n);
+         int zero_yee_diag = 0;
+         double min_scale = std::numeric_limits<double>::infinity();
+         double max_scale = 0.0;
+         for (int i = 0; i < n; i++)
+         {
+            const double gd = std::abs(Agal(i, i));
+            const double yd = std::abs(Aaux_(i, i));
+            if (yd > 1e-30)
+            {
+               scale[i] = std::sqrt(gd / yd);
+               min_scale = std::min(min_scale, scale[i]);
+               max_scale = std::max(max_scale, scale[i]);
+            }
+            else
+            {
+               scale[i] = 1.0;
+               zero_yee_diag++;
+            }
+         }
+         for (int i = 0; i < n; i++)
+         {
+            for (int j = 0; j < n; j++)
+            {
+               const double sij = scale[i] * scale[j];
+               Aaux_(i, j) *= sij;
+               if (AauxImag_.Height() == n)
+               {
+                  AauxImag_(i, j) *= sij;
+               }
+            }
+         }
+         if (mfem::Mpi::WorldRank() == 0)
+         {
+            std::cout << "[covariant_aux_space] Yee local diagonal calibration: "
+                      << "scale_range=[" << min_scale << ", " << max_scale
+                      << "], zero_yee_diag=" << zero_yee_diag << std::endl;
+         }
+      }
+      if (yee_masked_galerkin_calibration_)
+      {
+         mfem::DenseMatrix Agal;
+         const mfem::Operator &calib_op =
+            yee_calibration_op_ ? *yee_calibration_op_ : *op_;
+         BuildGalerkinEdgeCoarseMatrix(calib_op, Agal);
+         const int n = Aaux_.Height();
+         int mask_nnz = 0;
+         double gal_frob2 = 0.0;
+         double masked_frob2 = 0.0;
+         for (int i = 0; i < n; i++)
+         {
+            for (int j = 0; j < n; j++)
+            {
+               const double g = Agal(i, j);
+               gal_frob2 += g * g;
+               if (std::abs(Aaux_(i, j)) > 1e-14 || i == j)
+               {
+                  Aaux_(i, j) = g;
+                  masked_frob2 += g * g;
+                  mask_nnz++;
+               }
+               else
+               {
+                  Aaux_(i, j) = 0.0;
+                  if (AauxImag_.Height() == n)
+                  {
+                     AauxImag_(i, j) = 0.0;
+                  }
+               }
+            }
+         }
+         if (mfem::Mpi::WorldRank() == 0)
+         {
+            const double energy_ratio =
+               (gal_frob2 > 0.0) ? std::sqrt(masked_frob2 / gal_frob2) : 0.0;
+            std::cout << "[covariant_aux_space] Yee masked-Galerkin calibration: "
+                      << "mask_nnz=" << mask_nnz
+                      << ", density=" << double(mask_nnz) / double(n * n)
+                      << ", retained_frob_ratio=" << energy_ratio
+                      << std::endl;
+         }
+      }
+      if (yee_galerkin_block_radius_ > 0)
+      {
+         mfem::DenseMatrix Agal;
+         const mfem::Operator &calib_op =
+            yee_calibration_op_ ? *yee_calibration_op_ : *op_;
+         BuildGalerkinEdgeCoarseMatrix(calib_op, Agal);
+         const int n = Aaux_.Height();
+         int block_nnz = 0;
+         double gal_frob2 = 0.0;
+         double block_frob2 = 0.0;
+         for (int i = 0; i < n; i++)
+         {
+            const AuxDof &di = aux_dofs_[i];
+            for (int j = 0; j < n; j++)
+            {
+               const AuxDof &dj = aux_dofs_[j];
+               const int dist = std::max(std::abs(di.i - dj.i),
+                                  std::max(std::abs(di.j - dj.j),
+                                           std::abs(di.k - dj.k)));
+               const double g = Agal(i, j);
+               gal_frob2 += g * g;
+               if (dist <= yee_galerkin_block_radius_)
+               {
+                  Aaux_(i, j) = g;
+                  block_frob2 += g * g;
+                  block_nnz++;
+               }
+               else
+               {
+                  Aaux_(i, j) = 0.0;
+                  if (AauxImag_.Height() == n)
+                  {
+                     AauxImag_(i, j) = 0.0;
+                  }
+               }
+            }
+         }
+         if (mfem::Mpi::WorldRank() == 0)
+         {
+            const double energy_ratio =
+               (gal_frob2 > 0.0) ? std::sqrt(block_frob2 / gal_frob2) : 0.0;
+            std::cout << "[covariant_aux_space] Yee local Galerkin block: "
+                      << "radius=" << yee_galerkin_block_radius_
+                      << ", block_nnz=" << block_nnz
+                      << ", density=" << double(block_nnz) / double(n * n)
+                      << ", retained_frob_ratio=" << energy_ratio
+                      << std::endl;
+         }
       }
    }
    else
@@ -452,7 +641,22 @@ void CovariantReferencePreconditioner::BuildAuxiliaryMatrix() const
             AauxBlock_(na + i, na + j) = Aaux_(i, j);
          }
       }
-      AauxBlockInv_ = std::make_unique<mfem::DenseMatrixInverse>(AauxBlock_);
+      if (!yee_iterative_aux_solve_)
+      {
+         AauxBlockInv_ = std::make_unique<mfem::DenseMatrixInverse>(AauxBlock_);
+      }
+      if (mfem::Mpi::WorldRank() == 0)
+      {
+         std::cout << "[covariant_aux_space] Yee complex auxiliary solve mode: "
+                   << (yee_iterative_aux_solve_ ?
+                       (yee_bicgstab_aux_solve_ ? "inner BiCGSTAB" :
+                        (yee_gmres_aux_solve_ ? "inner GMRES" : "inner GMRES")) :
+                       "dense direct")
+                   << ", sqrt_pml_scaling=" << yee_sqrt_pml_scaling_
+                   << ", max_iter=" << yee_iterative_aux_max_iter_
+                   << ", rel_tol=" << yee_iterative_aux_rel_tol_
+                   << std::endl;
+      }
    }
    else
    {
@@ -461,7 +665,74 @@ void CovariantReferencePreconditioner::BuildAuxiliaryMatrix() const
       // Stronger regularization for robustness with non-uniform grids
       const double eps_reg = (max_diag > 0.0) ? std::max(1e-12, 1e-3 * max_diag) : 1.0;
       for (int i = 0; i < na; i++) { Aaux_(i, i) += eps_reg; }
-      AauxInv_ = std::make_unique<mfem::DenseMatrixInverse>(Aaux_);
+      if (!yee_iterative_aux_solve_)
+      {
+         AauxInv_ = std::make_unique<mfem::DenseMatrixInverse>(Aaux_);
+      }
+      else
+      {
+         if (yee_sparse_aux_solve_)
+         {
+            double max_abs = 0.0;
+            for (int j = 0; j < na; j++)
+            {
+               for (int i = 0; i < na; i++)
+               {
+                  max_abs = std::max(max_abs, std::abs(Aaux_(i, j)));
+               }
+            }
+            const double drop_tol = std::max(1e-14, 1e-14 * max_abs);
+            int nnz_inserted = 0;
+            int zero_diag = 0;
+            mfem::Vector inv_abs_diag(na);
+            AauxSparse_ = std::make_unique<mfem::SparseMatrix>(na);
+            for (int i = 0; i < na; i++)
+            {
+               const double diag = std::abs(Aaux_(i, i));
+               if (diag > 1e-30)
+               {
+                  inv_abs_diag[i] = 1.0 / diag;
+               }
+               else
+               {
+                  inv_abs_diag[i] = 0.0;
+                  zero_diag++;
+               }
+               for (int j = 0; j < na; j++)
+               {
+                  const double v = Aaux_(i, j);
+                  if (std::abs(v) > drop_tol)
+                  {
+                     AauxSparse_->Set(i, j, v);
+                     nnz_inserted++;
+                  }
+               }
+            }
+            AauxSparse_->Finalize(1);
+            AauxSparsePrec_ =
+               std::make_unique<DiagonalAbsInverseSolver>(inv_abs_diag);
+            if (mfem::Mpi::WorldRank() == 0)
+            {
+               std::cout << "[covariant_aux_space] Yee auxiliary sparse matrix: "
+                         << "nnz=" << AauxSparse_->NumNonZeroElems()
+                         << ", inserted=" << nnz_inserted
+                         << ", density="
+                         << double(AauxSparse_->NumNonZeroElems()) /
+                            double(na * na)
+                         << ", drop_tol=" << drop_tol
+                         << ", zero_diag=" << zero_diag << std::endl;
+            }
+         }
+         if (mfem::Mpi::WorldRank() == 0)
+         {
+            std::cout << "[covariant_aux_space] Yee auxiliary solve mode: "
+                      << (yee_gmres_aux_solve_ ? "inner GMRES" : "inner CG")
+                      << (AauxSparse_ ? " on sparse matrix" : " on dense matrix")
+                      << ", max_iter=" << yee_iterative_aux_max_iter_
+                      << ", rel_tol=" << yee_iterative_aux_rel_tol_
+                      << std::endl;
+         }
+      }
    }
 }
 
@@ -471,6 +742,90 @@ void CovariantReferencePreconditioner::BuildGalerkinEdgeCoarseMatrix(
    MFEM_VERIFY(op_ != nullptr,
                "Operator must be set before building Galerkin coarse matrix.");
    BuildGalerkinEdgeCoarseMatrix(*op_, Agal);
+}
+
+void CovariantReferencePreconditioner::SolveAuxiliarySystem(
+   const mfem::Vector &rhs,
+   mfem::Vector &sol) const
+{
+   if (!yee_iterative_aux_solve_)
+   {
+      AauxInv_->Mult(rhs, sol);
+      return;
+   }
+
+   sol.SetSize(rhs.Size());
+   sol = 0.0;
+   if (yee_gmres_aux_solve_)
+   {
+      mfem::GMRESSolver gmres;
+      if (AauxSparse_)
+      {
+         gmres.SetOperator(*AauxSparse_);
+         if (AauxSparsePrec_) { gmres.SetPreconditioner(*AauxSparsePrec_); }
+      }
+      else
+      {
+         gmres.SetOperator(Aaux_);
+      }
+      gmres.SetRelTol(yee_iterative_aux_rel_tol_);
+      gmres.SetAbsTol(0.0);
+      gmres.SetMaxIter(yee_iterative_aux_max_iter_);
+      gmres.SetKDim(std::min(50, yee_iterative_aux_max_iter_));
+      gmres.SetPrintLevel(-1);
+      gmres.Mult(rhs, sol);
+      return;
+   }
+
+   mfem::CGSolver cg;
+   if (AauxSparse_)
+   {
+      cg.SetOperator(*AauxSparse_);
+      if (AauxSparsePrec_) { cg.SetPreconditioner(*AauxSparsePrec_); }
+   }
+   else
+   {
+      cg.SetOperator(Aaux_);
+   }
+   cg.SetRelTol(yee_iterative_aux_rel_tol_);
+   cg.SetAbsTol(0.0);
+   cg.SetMaxIter(yee_iterative_aux_max_iter_);
+   cg.SetPrintLevel(-1);
+   cg.Mult(rhs, sol);
+}
+
+void CovariantReferencePreconditioner::SolveAuxiliaryBlockSystem(
+   const mfem::Vector &rhs,
+   mfem::Vector &sol) const
+{
+   if (!yee_iterative_aux_solve_)
+   {
+      AauxBlockInv_->Mult(rhs, sol);
+      return;
+   }
+
+   sol.SetSize(rhs.Size());
+   sol = 0.0;
+   if (yee_bicgstab_aux_solve_)
+   {
+      mfem::BiCGSTABSolver bicgstab;
+      bicgstab.SetOperator(AauxBlock_);
+      bicgstab.SetRelTol(yee_iterative_aux_rel_tol_);
+      bicgstab.SetAbsTol(0.0);
+      bicgstab.SetMaxIter(yee_iterative_aux_max_iter_);
+      bicgstab.SetPrintLevel(-1);
+      bicgstab.Mult(rhs, sol);
+      return;
+   }
+
+   mfem::GMRESSolver gmres;
+   gmres.SetOperator(AauxBlock_);
+   gmres.SetRelTol(yee_iterative_aux_rel_tol_);
+   gmres.SetAbsTol(0.0);
+   gmres.SetMaxIter(yee_iterative_aux_max_iter_);
+   gmres.SetKDim(std::min(50, yee_iterative_aux_max_iter_));
+   gmres.SetPrintLevel(-1);
+   gmres.Mult(rhs, sol);
 }
 
 void CovariantReferencePreconditioner::BuildGalerkinEdgeCoarseMatrix(
@@ -598,6 +953,7 @@ void CovariantReferencePreconditioner::BuildAuxiliaryOperators() const
    aux_sol_block_.SetSize(2 * na);
    BuildOperatorJacobiSmoother();
    BuildOperatorBlockJacobiSmoother();
+   BuildOperatorPatchBlockSmoother();
    built_ = true;
 }
 
@@ -776,11 +1132,259 @@ void CovariantReferencePreconditioner::AddOperatorBlockJacobiSmoother(
    z += op_block_jacobi_work_;
 }
 
+void CovariantReferencePreconditioner::BuildOperatorPatchBlockSmoother() const
+{
+   if (operator_patch_block_smoother_weight_ == 0.0) { return; }
+   MFEM_VERIFY(op_ != nullptr,
+               "Operator must be set before building patch block smoother.");
+
+   const int op_size = op_->Height();
+   MFEM_VERIFY(op_->Width() == op_size,
+               "Patch block smoother requires a square operator.");
+   if (!real_block_mode_)
+   {
+      MFEM_VERIFY(op_size % 2 == 0,
+                  "Patch block smoother requires a 2x2 real block system.");
+   }
+   const int n = real_block_mode_ ? op_size : op_size / 2;
+   if (!op_patch_block_invs_.empty()) { return; }
+   const mfem::Operator *patch_op =
+      (operator_patch_block_use_ref_op_ && operator_patch_block_ref_op_) ?
+      operator_patch_block_ref_op_ : op_;
+   MFEM_VERIFY(patch_op != nullptr,
+               "Patch block smoother reference operator is missing.");
+   op_patch_block_scalar_ =
+      real_block_mode_ || (patch_op->Height() == n && patch_op->Width() == n);
+   MFEM_VERIFY(op_patch_block_scalar_ ||
+               (patch_op->Height() == op_size && patch_op->Width() == op_size),
+               "Patch block smoother operator has incompatible dimensions.");
+
+   const int block_size = std::max(1, operator_patch_block_size_);
+   if (operator_element_patch_blocks_)
+   {
+      std::vector<char> assigned(n, 0);
+      mfem::Array<int> vdofs;
+      for (int eidx = 0; eidx < fespace_.GetNE(); eidx++)
+      {
+         fespace_.GetElementVDofs(eidx, vdofs);
+         std::vector<int> block_ids;
+         for (int q = 0; q < vdofs.Size(); q++)
+         {
+            const int ldof = (vdofs[q] < 0) ? -1 - vdofs[q] : vdofs[q];
+            const int tdof = fespace_.GetLocalTDofNumber(ldof);
+            if (tdof >= 0 && tdof < n && !assigned[tdof])
+            {
+               assigned[tdof] = 1;
+               block_ids.push_back(tdof);
+            }
+         }
+         std::sort(block_ids.begin(), block_ids.end());
+         block_ids.erase(std::unique(block_ids.begin(), block_ids.end()),
+                         block_ids.end());
+         if (!block_ids.empty())
+         {
+            op_patch_block_indices_.push_back(std::move(block_ids));
+         }
+      }
+      for (int i = 0; i < n; i++)
+      {
+         if (!assigned[i])
+         {
+            op_patch_block_indices_.push_back(std::vector<int>(1, i));
+         }
+      }
+   }
+   else
+   {
+      for (int start = 0; start < n; start += block_size)
+      {
+         const int m = std::min(block_size, n - start);
+         std::vector<int> block_ids(m);
+         for (int i = 0; i < m; i++) { block_ids[i] = start + i; }
+         op_patch_block_indices_.push_back(std::move(block_ids));
+      }
+   }
+
+   mfem::Vector e(patch_op->Width()), Ae(patch_op->Height());
+   int max_dim = 0;
+   for (const auto &ids : op_patch_block_indices_)
+   {
+      const int m = static_cast<int>(ids.size());
+      const int dim = op_patch_block_scalar_ ? m : 2 * m;
+      max_dim = std::max(max_dim, dim);
+      op_patch_block_sizes_.push_back(m);
+      auto block = std::make_unique<mfem::DenseMatrix>(dim, dim);
+      *block = 0.0;
+
+      for (int col = 0; col < dim; col++)
+      {
+         const int global_col = op_patch_block_scalar_ ?
+            ids[col] : ((col < m) ? ids[col] : (n + ids[col - m]));
+         e = 0.0;
+         e[global_col] = 1.0;
+         patch_op->Mult(e, Ae);
+         if (op_patch_block_scalar_)
+         {
+            for (int row = 0; row < m; row++)
+            {
+               (*block)(row, col) = Ae[ids[row]];
+            }
+         }
+         else
+         {
+            for (int row = 0; row < m; row++)
+            {
+               (*block)(row, col) = Ae[ids[row]];
+               (*block)(m + row, col) = Ae[n + ids[row]];
+            }
+         }
+      }
+
+      double max_diag = 0.0;
+      for (int i = 0; i < dim; i++)
+      {
+         max_diag = std::max(max_diag, std::abs((*block)(i, i)));
+      }
+      const double eps_reg =
+         (max_diag > 0.0) ? std::max(1e-12, 1e-10 * max_diag) : 1e-12;
+      for (int i = 0; i < dim; i++)
+      {
+         (*block)(i, i) += eps_reg;
+      }
+
+      op_patch_block_invs_.push_back(
+         std::make_unique<mfem::DenseMatrixInverse>(*block));
+      op_patch_block_mats_.push_back(std::move(block));
+   }
+
+   if (mfem::Mpi::WorldRank() == 0)
+   {
+      std::cout << "[covariant_aux_space] operator patch block smoother built: "
+                << "weight=" << operator_patch_block_smoother_weight_
+                << ", mode=" << (operator_element_patch_blocks_ ?
+                                  "element" : "contiguous")
+                << ", operator=" << (op_patch_block_scalar_ ? "scalar_ref" :
+                                      "full_block")
+                << ", block_size=" << block_size
+                << ", iterations=" << operator_patch_block_smoother_iterations_
+                << ", blocks=" << op_patch_block_invs_.size()
+                << ", max_block_dim=" << max_dim
+                << std::endl;
+   }
+}
+
+void CovariantReferencePreconditioner::AddOperatorPatchBlockSmoother(
+   const mfem::Vector &r,
+   mfem::Vector &z) const
+{
+   if (operator_patch_block_smoother_weight_ == 0.0) { return; }
+
+   const int rsize = r.Size();
+   if (!real_block_mode_)
+   {
+      MFEM_VERIFY(rsize % 2 == 0,
+                  "Patch block smoother requires a 2x2 real block residual.");
+   }
+   const int n = real_block_mode_ ? rsize : rsize / 2;
+   op_patch_block_work_.SetSize(rsize);
+   op_patch_block_res_.SetSize(rsize);
+   op_patch_block_Awork_.SetSize(rsize);
+   op_patch_block_work_ = 0.0;
+
+   for (int it = 0; it < operator_patch_block_smoother_iterations_; it++)
+   {
+      op_->Mult(op_patch_block_work_, op_patch_block_Awork_);
+      op_patch_block_res_ = r;
+      op_patch_block_res_.Add(-1.0, op_patch_block_Awork_);
+
+      for (int b = 0; b < (int)op_patch_block_invs_.size(); b++)
+      {
+         const auto &ids = op_patch_block_indices_[b];
+         const int m = op_patch_block_sizes_[b];
+         if (real_block_mode_)
+         {
+            mfem::Vector rhs(m), sol(m);
+            for (int i = 0; i < m; i++)
+            {
+               rhs[i] = op_patch_block_res_[ids[i]];
+            }
+            op_patch_block_invs_[b]->Mult(rhs, sol);
+            for (int i = 0; i < m; i++)
+            {
+               op_patch_block_work_[ids[i]] +=
+                  operator_patch_block_smoother_weight_ * sol[i];
+            }
+         }
+         else if (op_patch_block_scalar_)
+         {
+            mfem::Vector rhs(m), sol(m);
+            for (int i = 0; i < m; i++)
+            {
+               rhs[i] = op_patch_block_res_[ids[i]];
+            }
+            op_patch_block_invs_[b]->Mult(rhs, sol);
+            for (int i = 0; i < m; i++)
+            {
+               op_patch_block_work_[ids[i]] +=
+                  operator_patch_block_smoother_weight_ * sol[i];
+            }
+            for (int i = 0; i < m; i++)
+            {
+               rhs[i] = op_patch_block_res_[n + ids[i]];
+            }
+            op_patch_block_invs_[b]->Mult(rhs, sol);
+            for (int i = 0; i < m; i++)
+            {
+               op_patch_block_work_[n + ids[i]] +=
+                  operator_patch_block_smoother_weight_ * sol[i];
+            }
+         }
+         else
+         {
+            mfem::Vector rhs(2 * m), sol(2 * m);
+            for (int i = 0; i < m; i++)
+            {
+               rhs[i] = op_patch_block_res_[ids[i]];
+               rhs[m + i] = op_patch_block_res_[n + ids[i]];
+            }
+            op_patch_block_invs_[b]->Mult(rhs, sol);
+            for (int i = 0; i < m; i++)
+            {
+               op_patch_block_work_[ids[i]] +=
+                  operator_patch_block_smoother_weight_ * sol[i];
+               op_patch_block_work_[n + ids[i]] +=
+                  operator_patch_block_smoother_weight_ * sol[m + i];
+            }
+         }
+      }
+   }
+
+   z += op_patch_block_work_;
+}
+
 void CovariantReferencePreconditioner::Mult(const mfem::Vector &r,
                                             mfem::Vector &z) const
 {
    MFEM_VERIFY(op_ != nullptr, "Operator must be set before Mult().");
    const int tvsize = fespace_.GetTrueVSize();
+   if (real_block_mode_)
+   {
+      MFEM_VERIFY(r.Size() == tvsize, "Real-block residual size mismatch.");
+      BuildAuxiliaryOperators();
+
+      Pi_.MultTranspose(r, aux_rhs_);
+      SolveAuxiliarySystem(aux_rhs_, aux_sol_);
+      Pi_.Mult(aux_sol_, z);
+      z *= coarse_correction_weight_;
+      if (identity_smoother_weight_ != 0.0)
+      {
+         z.Add(identity_smoother_weight_, r);
+      }
+      AddOperatorJacobiSmoother(r, z);
+      AddOperatorPatchBlockSmoother(r, z);
+      return;
+   }
+
    MFEM_VERIFY(r.Size() == 2 * tvsize, "Residual size mismatch.");
 
    BuildAuxiliaryOperators();
@@ -802,7 +1406,7 @@ void CovariantReferencePreconditioner::Mult(const mfem::Vector &r,
 
       Pi_.MultTranspose(r_re_, rhs_re);
       Pi_.MultTranspose(r_im_, rhs_im);
-      AauxBlockInv_->Mult(aux_rhs_block_, aux_sol_block_);
+      SolveAuxiliaryBlockSystem(aux_rhs_block_, aux_sol_block_);
       Pi_.Mult(sol_re, z_re_);
       Pi_.Mult(sol_im, z_im_);
 
@@ -820,15 +1424,16 @@ void CovariantReferencePreconditioner::Mult(const mfem::Vector &r,
       }
       AddOperatorJacobiSmoother(r, z);
       AddOperatorBlockJacobiSmoother(r, z);
+      AddOperatorPatchBlockSmoother(r, z);
       return;
    }
 
    Pi_.MultTranspose(r_re_, aux_rhs_);
-   AauxInv_->Mult(aux_rhs_, aux_sol_);
+   SolveAuxiliarySystem(aux_rhs_, aux_sol_);
    Pi_.Mult(aux_sol_, z_re_);
 
    Pi_.MultTranspose(r_im_, aux_rhs_);
-   AauxInv_->Mult(aux_rhs_, aux_sol_);
+   SolveAuxiliarySystem(aux_rhs_, aux_sol_);
    Pi_.Mult(aux_sol_, z_im_);
 
    z.SetSize(2 * tvsize);
@@ -845,6 +1450,7 @@ void CovariantReferencePreconditioner::Mult(const mfem::Vector &r,
    }
    AddOperatorJacobiSmoother(r, z);
    AddOperatorBlockJacobiSmoother(r, z);
+   AddOperatorPatchBlockSmoother(r, z);
 }
 
 void CovariantReferencePreconditioner::PrintCoarseOperatorDiagnostics(

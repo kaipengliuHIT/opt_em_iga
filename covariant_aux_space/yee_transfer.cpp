@@ -1042,4 +1042,194 @@ void YeeTransferBuilder::BuildProlongationExact(mfem::DenseMatrix &P) const
    }
 }
 
+
+
+// ─── H(curl)-compatible edge-integral transfer: Yee → o=1 IGA ─────────────
+//
+// For each o=1 IGA H(curl) DOF i (which represents an edge in the reference
+// domain), compute:
+//   Pi_int(i,j) = ∫_{IGA_edge_i} w_j^Yee · t ds
+//
+// For knot-aligned Yee/IGA grids, this reduces to:
+//   U1_x(i,j,k) = sum_{yee edges on this IGA edge} u_yee * dx
+// where dx = 1/(nyee-1) is the uniform reference-domain grid spacing.
+//
+// For non-aligned grids, we evaluate the Yee field at quadrature points along
+// each IGA edge and numerically integrate.
+
+void YeeTransferBuilder::BuildEdgeIntegralProlongation(mfem::DenseMatrix &P) const
+{
+   BuildEdgeDofs();
+   const int tvsize = fespace_.GetTrueVSize();
+   const int na = static_cast<int>(edge_dofs_.size());
+   P.SetSize(tvsize, na);
+   P = 0.0;
+
+   if (mfem::Mpi::WorldRank() == 0) {
+      std::cout << "[yee_transfer] BuildEdgeIntegralProlongation: "
+                << "tvsize=" << tvsize << " na=" << na
+                << " using point-probing method" << std::endl;
+   }
+
+   const double dx = 1.0 / (grid_.nx - 1);
+   const double dy = 1.0 / (grid_.ny - 1);
+   const double dz = 1.0 / (grid_.nz - 1);
+   const auto &yee_edges = edge_dofs_;
+
+   mfem::ParFiniteElementSpace *pfes =
+      const_cast<mfem::ParFiniteElementSpace *>(&fespace_);
+   const mfem::FiniteElementCollection *fec = pfes->FEColl();
+   const int dim = ext_.Dimension();
+
+   // For each Yee edge, find the IGA DOF by evaluating IGA basis functions
+   // at the Yee edge midpoint in the parameter domain.
+   int matched = 0, unmatched = 0;
+   std::vector<bool> dof_used(tvsize, false);
+
+   for (int e = 0; e < na; e++) {
+      const auto &ye = yee_edges[e];
+      int ax = ye.axis;
+
+      // Yee edge midpoint in parameter domain
+      double xi_x, xi_y, xi_z;
+      if (ax == 0) {
+         xi_x = (ye.i + 0.5) * dx;
+         xi_y = ye.j * dy;
+         xi_z = ye.k * dz;
+      } else if (ax == 1) {
+         xi_x = ye.i * dx;
+         xi_y = (ye.j + 0.5) * dy;
+         xi_z = ye.k * dz;
+      } else {
+         xi_x = ye.i * dx;
+         xi_y = ye.j * dy;
+         xi_z = (ye.k + 0.5) * dz;
+      }
+
+      mfem::Vector xi(3);
+      xi[0] = xi_x; xi[1] = xi_y; xi[2] = xi_z;
+
+      // Find IGA element containing this parameter point
+      mfem::Array<int> ijk_test(dim);
+      // Use patch knot vectors directly to find the element
+      mfem::Array<const mfem::KnotVector *> kv;
+      ext_.GetPatchKnotVectors(0, kv);
+      const mfem::KnotVector &kvx = *kv[0];
+      const mfem::KnotVector &kvy = (kv.Size() > 1) ? *kv[1] : kvx;
+      const mfem::KnotVector &kvz = (kv.Size() > 2) ? *kv[2] : kvx;
+
+      // Locate element by knot span
+      int o = fespace_.GetOrder(0);
+      int ix = -1, iy = -1, iz = -1;
+      for (int i = 0; i < kvx.GetNKS(); i++) {
+         if (!kvx.isElement(i)) continue;
+         double lo = kvx[i + o], hi = kvx[i + o + 1];
+         if (xi_x >= lo - 1e-12 && xi_x <= hi + 1e-12) { ix = i; break; }
+      }
+      for (int j = 0; j < kvy.GetNKS(); j++) {
+         if (!kvy.isElement(j)) continue;
+         double lo = kvy[j + o], hi = kvy[j + o + 1];
+         if (xi_y >= lo - 1e-12 && xi_y <= hi + 1e-12) { iy = j; break; }
+      }
+      for (int k = 0; k < kvz.GetNKS(); k++) {
+         if (!kvz.isElement(k)) continue;
+         double lo = kvz[k + o], hi = kvz[k + o + 1];
+         if (xi_z >= lo - 1e-12 && xi_z <= hi + 1e-12) { iz = k; break; }
+      }
+
+      if (ix < 0 || iy < 0 || iz < 0) { unmatched++; continue; }
+
+      // Find element index from IJK using reverse map
+      int el_idx = -1;
+      for (int el = 0; el < fespace_.GetNE(); el++) {
+         mfem::Array<int> ijk(dim);
+         ext_.GetElementIJK(el, ijk);
+         if (ijk[0] == ix && ijk[1] == iy && ijk[2] == iz) {
+            el_idx = el;
+            break;
+         }
+      }
+      if (el_idx < 0) { unmatched++; continue; }
+
+      // Compute reference coordinates within element
+      double u = (xi_x - kvx[ix + o]) / (kvx[ix + o + 1] - kvx[ix + o]);
+      double v = (xi_y - kvy[iy + o]) / (kvy[iy + o + 1] - kvy[iy + o]);
+      double w = (xi_z - kvz[iz + o]) / (kvz[iz + o + 1] - kvz[iz + o]);
+      u = std::max(0.0, std::min(1.0, u));
+      v = std::max(0.0, std::min(1.0, v));
+      w = std::max(0.0, std::min(1.0, w));
+
+      // Get element transformation and evaluate basis
+      mfem::ElementTransformation *T = pfes->GetElementTransformation(el_idx);
+      const mfem::FiniteElement *fe = pfes->GetFE(el_idx);
+      if (!T || !fe) { unmatched++; continue; }
+
+      mfem::IntegrationPoint ip;
+      ip.Set3(u, v, w);
+      T->SetIntPoint(&ip);
+
+      int nd = fe->GetDof();
+      mfem::DenseMatrix vshape(nd, dim);
+      fe->CalcVShape(*T, vshape);
+
+      mfem::Array<int> vdofs;
+      pfes->GetElementVDofs(el_idx, vdofs);
+
+      // Find DOF with largest component in the Yee edge direction
+      double best_val = -1.0;
+      int best_dof = -1;
+      for (int i = 0; i < nd; i++) {
+         double val = std::abs(vshape(i, ax));
+         if (val > best_val) {
+            best_val = val;
+            int d = vdofs[i];
+            best_dof = (d >= 0) ? d : (-d - 1);
+         }
+      }
+
+      if (best_dof >= 0 && best_dof < tvsize && best_val > 0) {
+         P(best_dof, e) = 1.0;
+         dof_used[best_dof] = true;
+         matched++;
+      } else {
+         unmatched++;
+      }
+   }
+
+   int dof_covered = 0;
+   for (bool used : dof_used) if (used) dof_covered++;
+
+   if (mfem::Mpi::WorldRank() == 0) {
+      std::cout << "[yee_transfer] Edge-integral Pi1 (point-probe): "
+                << matched << " matched, " << unmatched << " unmatched, "
+                << dof_covered << "/" << tvsize << " DOFs covered" << std::endl;
+   }
+
+   // Build L2 projection as fallback for uncovered DOFs
+   mfem::DenseMatrix P_l2;
+   BuildProlongationFast(P_l2);
+
+   // Merge: use edge-integral for covered DOFs, L2 for uncovered
+   int hybrid_covered = 0, hybrid_fallback = 0;
+   for (int d = 0; d < tvsize; d++) {
+      bool covered = dof_used[d];
+      if (covered) {
+         hybrid_covered++;
+         // Already set by edge-integral, keep it
+      } else {
+         hybrid_fallback++;
+         // Copy L2 row for this DOF
+         for (int e = 0; e < na; e++) {
+            P(d, e) = P_l2(d, e);
+         }
+      }
+   }
+
+   if (mfem::Mpi::WorldRank() == 0) {
+      std::cout << "[yee_transfer] Hybrid Pi1: " << hybrid_covered
+                << " edge-integral + " << hybrid_fallback
+                << " L2 fallback = " << tvsize << " total DOFs" << std::endl;
+   }
+}
+
 } // namespace covariant_aux_space

@@ -12,14 +12,19 @@ MFEM_EXT_LIBS = -Wl,-rpath,$(OPT_DIR)/hypre/lib -L$(OPT_DIR)/hypre/lib -lHYPRE \
                 $(OPT_DIR)/metis/lib/libmetis.a \
                 -Wl,-rpath,$(OPT_DIR)/openmpi/lib -L$(OPT_DIR)/openmpi/lib -lmpi
 
-# CUDA and cuDSS paths
-CUDA_DIR = /usr/local/cuda-12.8
-CUDSS_LIB_DIR = /usr/lib/x86_64-linux-gnu/libcudss/12
+# CUDA 12.8 system toolkit (installed via: sudo apt install cuda-toolkit-12-8)
+CUDA_DIR          = /usr/local/cuda-12.8
+CUDSS_LIB_DIR     = /usr/lib/x86_64-linux-gnu/libcudss/12
+
+CUDA_INCLUDE_DIRS = -I$(CUDA_DIR)/include
+CUDA_LIB_DIRS     = $(CUDA_DIR)/lib64
+CUDA_RPATH        = -Wl,-rpath,$(CUDA_DIR)/lib64
+CUDA_LINK         = -L$(CUDA_DIR)/lib64 $(CUDA_RPATH) -lcublas -lcublasLt -lcudart
 
 # Compiler and flags
 CXX = $(MFEM_CXX)
-CXXFLAGS = $(MFEM_CXXFLAGS) -I$(MFEM_SRC_DIR) -I$(MFEM_BUILD_DIR) -I$(MFEM_BUILD_DIR)/config -I./to_nurbs_patch -I$(CUDA_DIR)/include -I$(CUDA_DIR)/targets/x86_64-linux/include $(MFEM_TPLFLAGS)
-DEBUG_CXXFLAGS = -std=c++17 -O0 -g -I$(MFEM_SRC_DIR) -I$(MFEM_BUILD_DIR) -I$(MFEM_BUILD_DIR)/config -I./to_nurbs_patch -I$(CUDA_DIR)/include -I$(CUDA_DIR)/targets/x86_64-linux/include $(MFEM_TPLFLAGS)
+CXXFLAGS = $(MFEM_CXXFLAGS) -I$(MFEM_SRC_DIR) -I$(MFEM_BUILD_DIR) -I$(MFEM_BUILD_DIR)/config -I./to_nurbs_patch $(MFEM_TPLFLAGS)
+DEBUG_CXXFLAGS = -std=c++17 -O0 -g -I$(MFEM_SRC_DIR) -I$(MFEM_BUILD_DIR) -I$(MFEM_BUILD_DIR)/config -I./to_nurbs_patch $(MFEM_TPLFLAGS)
 
 # Linker flags (directly link to CUDA 12 version of cuDSS)
 LDFLAGS = -L$(MFEM_BUILD_DIR) -lmfem $(MFEM_EXT_LIBS) -L$(CUDA_DIR)/lib64 -lcudart -lcublas -lcublasLt -Wl,-rpath,$(CUDSS_LIB_DIR) $(CUDSS_LIB_DIR)/libcudss.so.0.7.1
@@ -149,7 +154,67 @@ run_bend1: bend_topology_opt
 run_topo: soi_topology_opt
 	mpirun -np 4 ./soi_topology_opt -m $(MFEM_SRC_DIR)/data/cube-nurbs.mesh -r 3 -mi 30 -nx 15 -ny 15
 
-.PHONY: all clean run run1 run_bend run_bend1 run_topo
+# ── GPU BiCGSTAB solver (maxwellb-style, C++) ─────────────────────────────────
+CUDA_SOLVER_DIR = cuda_iterative_solver
+COVARIANT_DIR   = covariant_aux_space
+
+# Shared objects for both CPU and GPU builds
+BICGSTAB_SHARED_OBJS = \
+	$(CUDA_SOLVER_DIR)/gpu_bicgstab.o \
+	$(COVARIANT_DIR)/iga_patch_ras_preconditioner.o
+
+# CPU-only build: no CUDA headers needed, CpuBiCGSTABSolver only
+gpu_bicgstab_demo_cpu: \
+	$(CUDA_SOLVER_DIR)/gpu_bicgstab_demo.cpu.o \
+	$(BICGSTAB_SHARED_OBJS)
+	$(CXX) $(CXXFLAGS) -I./$(COVARIANT_DIR) -I./$(CUDA_SOLVER_DIR) \
+	  -o $@ $^ $(LDFLAGS_NO_CUDSS)
+
+$(CUDA_SOLVER_DIR)/gpu_bicgstab_demo.cpu.o: \
+	$(CUDA_SOLVER_DIR)/gpu_bicgstab_demo.cpp \
+	$(CUDA_SOLVER_DIR)/gpu_bicgstab.hpp \
+	$(COVARIANT_DIR)/iga_patch_ras_preconditioner.hpp
+	$(CXX) $(CXXFLAGS) -I./$(COVARIANT_DIR) -I./$(CUDA_SOLVER_DIR) \
+	  -c $< -o $@
+
+# GPU build: -DHAVE_CUDA, headers+libs from conda pytorch nvidia packages
+GPU_LDFLAGS = $(LDFLAGS_NO_CUDSS) $(CUDA_LINK)
+
+gpu_bicgstab_demo_gpu: \
+	$(CUDA_SOLVER_DIR)/gpu_bicgstab_demo.gpu.o \
+	$(CUDA_SOLVER_DIR)/gpu_bicgstab.gpu.o \
+	$(COVARIANT_DIR)/iga_patch_ras_preconditioner.o
+	$(CXX) $(CXXFLAGS) -DHAVE_CUDA \
+	  -I./$(COVARIANT_DIR) -I./$(CUDA_SOLVER_DIR) $(CUDA_INCLUDE_DIRS) \
+	  -o $@ $^ $(GPU_LDFLAGS)
+
+$(CUDA_SOLVER_DIR)/gpu_bicgstab_demo.gpu.o: \
+	$(CUDA_SOLVER_DIR)/gpu_bicgstab_demo.cpp \
+	$(CUDA_SOLVER_DIR)/gpu_bicgstab.hpp \
+	$(COVARIANT_DIR)/iga_patch_ras_preconditioner.hpp
+	$(CXX) $(CXXFLAGS) -DHAVE_CUDA \
+	  -I./$(COVARIANT_DIR) -I./$(CUDA_SOLVER_DIR) $(CUDA_INCLUDE_DIRS) \
+	  -c $< -o $@
+
+$(CUDA_SOLVER_DIR)/gpu_bicgstab.gpu.o: \
+	$(CUDA_SOLVER_DIR)/gpu_bicgstab.cpp \
+	$(CUDA_SOLVER_DIR)/gpu_bicgstab.hpp
+	$(CXX) $(CXXFLAGS) -DHAVE_CUDA \
+	  -I./$(COVARIANT_DIR) -I./$(CUDA_SOLVER_DIR) $(CUDA_INCLUDE_DIRS) \
+	  -c $< -o $@
+
+# Shared (CPU-only) object for gpu_bicgstab.cpp
+$(CUDA_SOLVER_DIR)/gpu_bicgstab.o: \
+	$(CUDA_SOLVER_DIR)/gpu_bicgstab.cpp \
+	$(CUDA_SOLVER_DIR)/gpu_bicgstab.hpp
+	$(CXX) $(CXXFLAGS) -I./$(COVARIANT_DIR) -I./$(CUDA_SOLVER_DIR) \
+	  -c $< -o $@
+
+.PHONY: all clean run run1 run_bend run_bend1 run_topo \
+        gpu_bicgstab_demo_cpu gpu_bicgstab_demo_gpu \
+        pml_point_source_demo pml_point_source_demo_gpu \
+        pml_pi_prec_test \
+        pml_split_demo
 
 focusing_lens_opt: focusing_lens_opt.o
 	$(CXX) $(CXXFLAGS) -o focusing_lens_opt focusing_lens_opt.o $(LDFLAGS)
@@ -392,20 +457,54 @@ test_point_source.o: test_point_source.cpp em_opt/pml_coefficients.hpp em_opt/cu
 	$(CXX) $(CXXFLAGS) -I./em_opt -c test_point_source.cpp -o test_point_source.o
 
 # NURBS 3D point-source PML demo for AMS vs edge-Yee comparison
-pml_point_source_demo: \
-	pml_point_source_demo.o \
+PML_DEMO_SHARED_OBJS = \
 	covariant_aux_space/yee_transfer.o \
 	covariant_aux_space/yee_operator.o \
 	covariant_aux_space/covariant_reference_preconditioner.o \
+	covariant_aux_space/iga_patch_ras_preconditioner.o \
 	fdfd_iga_init/reference_fdfd_cpu.o \
 	fdfd_iga_init/reference_initial_guess.o
-	$(CXX) $(CXXFLAGS) -I./fdfd_iga_init -I./covariant_aux_space -o pml_point_source_demo $^ $(LDFLAGS_NO_CUDSS)
+
+# CPU build: supports -solver gmres|bicgstab_cpu (default, no CUDA)
+pml_point_source_demo: \
+	pml_point_source_demo.o \
+	$(CUDA_SOLVER_DIR)/gpu_bicgstab.o \
+	$(PML_DEMO_SHARED_OBJS)
+	$(CXX) $(CXXFLAGS) -I./fdfd_iga_init -I./$(COVARIANT_DIR) -I./$(CUDA_SOLVER_DIR) \
+	  -o $@ $^ $(LDFLAGS_NO_CUDSS)
 
 pml_point_source_demo.o: \
 	pml_point_source_demo.cpp \
 	fdfd_iga_init/reference_patch_evaluator.hpp \
-	covariant_aux_space/covariant_reference_preconditioner.hpp
-	$(CXX) $(CXXFLAGS) -I./fdfd_iga_init -I./covariant_aux_space -c pml_point_source_demo.cpp -o $@
+	covariant_aux_space/covariant_reference_preconditioner.hpp \
+	covariant_aux_space/iga_patch_ras_preconditioner.hpp \
+	$(CUDA_SOLVER_DIR)/gpu_bicgstab.hpp
+	$(CXX) $(CXXFLAGS) -I./fdfd_iga_init -I./$(COVARIANT_DIR) -I./$(CUDA_SOLVER_DIR) \
+	  -c pml_point_source_demo.cpp -o $@
+
+# GPU build: adds -solver bicgstab_gpu support (-DHAVE_CUDA, links cuBLAS)
+pml_point_source_demo_gpu: \
+	pml_point_source_demo.gpu.o \
+	$(CUDA_SOLVER_DIR)/gpu_bicgstab.gpu.o \
+	$(PML_DEMO_SHARED_OBJS)
+	$(CXX) $(CXXFLAGS) -DHAVE_CUDA \
+	  -I./fdfd_iga_init -I./$(COVARIANT_DIR) -I./$(CUDA_SOLVER_DIR) $(CUDA_INCLUDE_DIRS) \
+	  -o $@ $^ $(GPU_LDFLAGS)
+
+pml_point_source_demo.gpu.o: \
+	pml_point_source_demo.cpp \
+	fdfd_iga_init/reference_patch_evaluator.hpp \
+	covariant_aux_space/covariant_reference_preconditioner.hpp \
+	covariant_aux_space/iga_patch_ras_preconditioner.hpp \
+	$(CUDA_SOLVER_DIR)/gpu_bicgstab.hpp
+	$(CXX) $(CXXFLAGS) -DHAVE_CUDA \
+	  -I./fdfd_iga_init -I./$(COVARIANT_DIR) -I./$(CUDA_SOLVER_DIR) $(CUDA_INCLUDE_DIRS) \
+	  -c pml_point_source_demo.cpp -o $@
+
+covariant_aux_space/iga_patch_ras_preconditioner.o: \
+	covariant_aux_space/iga_patch_ras_preconditioner.cpp \
+	covariant_aux_space/iga_patch_ras_preconditioner.hpp
+	$(CXX) $(CXXFLAGS) -I./covariant_aux_space -c covariant_aux_space/iga_patch_ras_preconditioner.cpp -o $@
 
 # ── Minimal demo with factory interface ──────────────────────────────
 minimal_demo: fdfd_iga_init/minimal_demo.o \
@@ -413,11 +512,179 @@ minimal_demo: fdfd_iga_init/minimal_demo.o \
 	fdfd_iga_init/reference_initial_guess.o \
 	covariant_aux_space/yee_transfer.o \
 	covariant_aux_space/yee_operator.o \
-	covariant_aux_space/covariant_reference_preconditioner.o
+	covariant_aux_space/covariant_reference_preconditioner.o \
+	covariant_aux_space/iga_patch_ras_preconditioner.o
 	$(CXX) $(CXXFLAGS) -I./fdfd_iga_init -I./covariant_aux_space -o $@ $^ $(LDFLAGS_NO_CUDSS)
 
 fdfd_iga_init/minimal_demo.o: fdfd_iga_init/minimal_demo.cpp \
 	fdfd_iga_init/reference_fdfd_cpu.hpp \
 	fdfd_iga_init/reference_patch_evaluator.hpp \
-	covariant_aux_space/covariant_preconditioner_factory.hpp
+	covariant_aux_space/covariant_preconditioner_factory.hpp \
+	covariant_aux_space/iga_patch_ras_preconditioner.hpp
 	$(CXX) $(CXXFLAGS) -I./fdfd_iga_init -I./covariant_aux_space -c $< -o $@
+
+# ── PML Split Preconditioner research demo ────────────────────────────────────
+SPLIT_DIR = pml_split_preconditioner
+
+pml_split_demo: \
+	$(SPLIT_DIR)/pml_split_demo.o \
+	$(SPLIT_DIR)/split_pml_prec.o \
+	covariant_aux_space/yee_transfer.o \
+	covariant_aux_space/yee_operator.o \
+	fdfd_iga_init/reference_fdfd_cpu.o
+	$(CXX) $(CXXFLAGS) \
+	  -I./$(SPLIT_DIR) -I./$(COVARIANT_DIR) -I./fdfd_iga_init \
+	  -o $@ $^ $(LDFLAGS_NO_CUDSS)
+
+$(SPLIT_DIR)/pml_split_demo.o: \
+	$(SPLIT_DIR)/pml_split_demo.cpp \
+	$(SPLIT_DIR)/split_pml_prec.hpp \
+	fdfd_iga_init/reference_patch_evaluator.hpp \
+	covariant_aux_space/yee_transfer.hpp \
+	covariant_aux_space/yee_operator.hpp
+	$(CXX) $(CXXFLAGS) \
+	  -I./$(SPLIT_DIR) -I./$(COVARIANT_DIR) -I./fdfd_iga_init \
+	  -c $< -o $@
+
+$(SPLIT_DIR)/split_pml_prec.o: \
+	$(SPLIT_DIR)/split_pml_prec.cpp \
+	$(SPLIT_DIR)/split_pml_prec.hpp \
+	covariant_aux_space/yee_transfer.hpp \
+	covariant_aux_space/yee_operator.hpp \
+	fdfd_iga_init/reference_patch_evaluator.hpp
+	$(CXX) $(CXXFLAGS) \
+	  -I./$(SPLIT_DIR) -I./$(COVARIANT_DIR) -I./fdfd_iga_init \
+	  -c $< -o $@
+
+# ── Yee initial guess demo ─────────────────────────────────────────────────
+YEE_INIT_DIR = yee_init_guess
+
+yee_init_guess_demo: \
+	$(YEE_INIT_DIR)/yee_init_guess_demo.o \
+	$(YEE_INIT_DIR)/yee_to_iga_transfer.o \
+	covariant_aux_space/yee_operator.o \
+	covariant_aux_space/yee_transfer.o \
+	fdfd_iga_init/reference_fdfd_cpu.o
+	$(CXX) $(CXXFLAGS) -I./$(YEE_INIT_DIR) -I./covariant_aux_space -I./fdfd_iga_init \
+	  -o $@ $^ $(LDFLAGS_NO_CUDSS)
+
+$(YEE_INIT_DIR)/yee_init_guess_demo.o: \
+	$(YEE_INIT_DIR)/yee_init_guess_demo.cpp \
+	$(YEE_INIT_DIR)/yee_to_iga_transfer.hpp \
+	covariant_aux_space/yee_operator.hpp \
+	fdfd_iga_init/reference_patch_evaluator.hpp
+	$(CXX) $(CXXFLAGS) -I./$(YEE_INIT_DIR) -I./covariant_aux_space -I./fdfd_iga_init \
+	  -c $< -o $@
+
+$(YEE_INIT_DIR)/yee_to_iga_transfer.o: \
+	$(YEE_INIT_DIR)/yee_to_iga_transfer.cpp \
+	$(YEE_INIT_DIR)/yee_to_iga_transfer.hpp
+	$(CXX) $(CXXFLAGS) -I./$(YEE_INIT_DIR) -I./covariant_aux_space -I./fdfd_iga_init \
+	  -c $< -o $@
+
+# ── IGA AMS Preconditioner demo ───────────────────────────────────────────────
+IGA_AMS_DIR = iga_ams_preconditioner
+
+iga_ams_demo: \
+	$(IGA_AMS_DIR)/iga_ams_demo.o \
+	$(IGA_AMS_DIR)/iga_ams_prec.o
+	$(CXX) $(CXXFLAGS) -I./$(IGA_AMS_DIR) -I./fdfd_iga_init \
+	  -o $@ $^ $(LDFLAGS_NO_CUDSS)
+
+$(IGA_AMS_DIR)/iga_ams_demo.o: \
+	$(IGA_AMS_DIR)/iga_ams_demo.cpp \
+	$(IGA_AMS_DIR)/iga_ams_prec.hpp \
+	fdfd_iga_init/reference_patch_evaluator.hpp
+	$(CXX) $(CXXFLAGS) -I./$(IGA_AMS_DIR) -I./fdfd_iga_init \
+	  -c $< -o $@
+
+$(IGA_AMS_DIR)/iga_ams_prec.o: \
+	$(IGA_AMS_DIR)/iga_ams_prec.cpp \
+	$(IGA_AMS_DIR)/iga_ams_prec.hpp
+	$(CXX) $(CXXFLAGS) -I./$(IGA_AMS_DIR) \
+	  -c $< -o $@
+
+# ── AMS Diagnostics ──────────────────────────────────────────────────────────
+ams_diagnostics: \
+	$(IGA_AMS_DIR)/ams_diagnostics.o \
+	$(IGA_AMS_DIR)/iga_ams_prec.o
+	$(CXX) $(CXXFLAGS) -I./$(IGA_AMS_DIR) -I./fdfd_iga_init \
+	  -o $@ $^ $(LDFLAGS_NO_CUDSS)
+
+$(IGA_AMS_DIR)/ams_diagnostics.o: \
+	$(IGA_AMS_DIR)/ams_diagnostics.cpp \
+	fdfd_iga_init/reference_patch_evaluator.hpp
+	$(CXX) $(CXXFLAGS) -I./$(IGA_AMS_DIR) -I./fdfd_iga_init \
+	  -c $< -o $@
+
+# ── AMS Algebraic Diagnostics ─────────────────────────────────────────────────
+ams_algebraic_diag: $(IGA_AMS_DIR)/ams_algebraic_diag.o
+	$(CXX) $(CXXFLAGS) -I./$(IGA_AMS_DIR) -I./fdfd_iga_init \
+	  -o $@ $^ $(LDFLAGS_NO_CUDSS)
+
+$(IGA_AMS_DIR)/ams_algebraic_diag.o: $(IGA_AMS_DIR)/ams_algebraic_diag.cpp
+	$(CXX) $(CXXFLAGS) -I./$(IGA_AMS_DIR) -I./fdfd_iga_init \
+	  -c $< -o $@
+
+# ── AMS IGA Coupled Preconditioner ───────────────────────────────────────────
+ams_iga_coupled: $(IGA_AMS_DIR)/ams_iga_coupled.o
+	$(CXX) $(CXXFLAGS) -I./$(IGA_AMS_DIR) -I./fdfd_iga_init \
+	  -o $@ $^ $(LDFLAGS_NO_CUDSS)
+
+$(IGA_AMS_DIR)/ams_iga_coupled.o: $(IGA_AMS_DIR)/ams_iga_coupled.cpp
+	$(CXX) $(CXXFLAGS) -I./$(IGA_AMS_DIR) -I./fdfd_iga_init \
+	  -c $< -o $@
+
+# ── Q=[G,Pi] Preconditioner Benchmark ─────────────────────────────────────────
+ams_q_preconditioner: $(IGA_AMS_DIR)/ams_q_preconditioner.o
+	$(CXX) $(CXXFLAGS) -I./$(IGA_AMS_DIR) -I./fdfd_iga_init \
+	  -o $@ $^ $(LDFLAGS_NO_CUDSS)
+
+$(IGA_AMS_DIR)/ams_q_preconditioner.o: $(IGA_AMS_DIR)/ams_q_preconditioner.cpp
+	$(CXX) $(CXXFLAGS) -I./$(IGA_AMS_DIR) -I./fdfd_iga_init \
+	  -c $< -o $@
+
+# ── AMS Parameter Sweep ────────────────────────────────────────────────────────
+ams_sweep: $(IGA_AMS_DIR)/ams_sweep.o
+	$(CXX) $(CXXFLAGS) -I./$(IGA_AMS_DIR) -I./fdfd_iga_init \
+	  -o $@ $^ $(LDFLAGS_NO_CUDSS)
+
+$(IGA_AMS_DIR)/ams_sweep.o: $(IGA_AMS_DIR)/ams_sweep.cpp
+	$(CXX) $(CXXFLAGS) -I./$(IGA_AMS_DIR) -I./fdfd_iga_init \
+	  -c $< -o $@
+
+# ── AMS Sweep v2 (sparse Pi) ──────────────────────────────────────────────────
+ams_sweep_v2: $(IGA_AMS_DIR)/ams_sweep_v2.o
+	$(CXX) $(CXXFLAGS) -I./$(IGA_AMS_DIR) -I./fdfd_iga_init \
+	  -o $@ $^ $(LDFLAGS_NO_CUDSS)
+
+$(IGA_AMS_DIR)/ams_sweep_v2.o: $(IGA_AMS_DIR)/ams_sweep_v2.cpp
+	$(CXX) $(CXXFLAGS) -I./$(IGA_AMS_DIR) -I./fdfd_iga_init \
+	  -c $< -o $@
+
+# ── PML Pi_lumped complex preconditioner test ────────────────────────────────
+pml_pi_prec_test: pml_pi_prec_test.o
+	$(CXX) $(CXXFLAGS) -I./fdfd_iga_init -I./$(COVARIANT_DIR) \
+	  -o $@ $^ $(LDFLAGS_NO_CUDSS)
+
+pml_pi_prec_test.o: pml_pi_prec_test.cpp
+	$(CXX) $(CXXFLAGS) -I./fdfd_iga_init -I./$(COVARIANT_DIR) \
+	  -c $< -o $@
+
+# ── AMS Sweep v3 (fully sparse Pi_lumped) ──────────────────────────────────
+ams_sweep_v3: $(IGA_AMS_DIR)/ams_sweep_v3.o
+	$(CXX) $(CXXFLAGS) -I./$(IGA_AMS_DIR) -I./fdfd_iga_init \
+	  -o $@ $^ $(LDFLAGS_NO_CUDSS)
+
+$(IGA_AMS_DIR)/ams_sweep_v3.o: $(IGA_AMS_DIR)/ams_sweep_v3.cpp
+	$(CXX) $(CXXFLAGS) -I./$(IGA_AMS_DIR) -I./fdfd_iga_init \
+	  -c $< -o $@
+
+# ── Preconditioner Selector (SPD + PML) ────────────────────────────────────
+prec_selector: prec_selector.o
+	$(CXX) $(CXXFLAGS) -I./fdfd_iga_init -I./$(COVARIANT_DIR) \
+	  -o $@ $^ $(LDFLAGS_NO_CUDSS)
+
+prec_selector.o: prec_selector.cpp
+	$(CXX) $(CXXFLAGS) -I./fdfd_iga_init -I./$(COVARIANT_DIR) \
+	  -c $< -o $@
